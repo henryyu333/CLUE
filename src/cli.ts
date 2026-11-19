@@ -36,7 +36,7 @@ import {
 } from "./recall/index.ts";
 import { installHarnessAdapter, type InstallTarget } from "./adapters/install.ts";
 
-const VERSION = "0.1";
+const VERSION = "0.2";
 
 function parseArgs(argv: string[]): { positionals: string[]; flags: Record<string, string | boolean> } {
 	const positionals: string[] = [];

@@ -278,6 +278,9 @@ describe("intent classification & guardrails", () => {
 		expect(classifyPromptIntent("kick off").isStart).toBe(true);
 		expect(classifyPromptIntent("那先收尾吧").isWrapUp).toBe(true);
 		expect(classifyPromptIntent("好了，今天先收工").isWrapUp).toBe(true);
+		expect(classifyPromptIntent("本地可以合入main然后推送到GitHub发新版。做完这些就收尾吧").isWrapUp).toBe(true);
+		expect(classifyPromptIntent("发完新版本就收工").isWrapUp).toBe(true);
+		expect(classifyPromptIntent("搞定之后然后就收尾吧").isWrapUp).toBe(true);
 		expect(classifyPromptIntent("wrap up").isWrapUp).toBe(true);
 		expect(classifyPromptIntent("好了，先这样吧").isCasualClose).toBe(true);
 		expect(classifyPromptIntent("没事了，谢谢").isCasualClose).toBe(true);
