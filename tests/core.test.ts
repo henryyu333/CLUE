@@ -21,6 +21,7 @@ import {
 	type ClueConfig,
 	type CluePaths,
 } from "../src/core/index.ts";
+import { installHarnessAdapter } from "../src/adapters/install.ts";
 
 let tempHome: string;
 let config: ClueConfig;
@@ -270,22 +271,56 @@ describe("pitfalls FTS5, evidence & anti-anchoring", () => {
 });
 
 describe("intent classification & guardrails", () => {
-	test("triggers on rituals & casual close without false positives on continuation prompts", () => {
+	test("triggers on genuine imperative rituals without false positives on questions, quotes, or meta-discussion", () => {
+		// Genuine imperatives
 		expect(classifyPromptIntent("开工，今天修一下登录页").isStart).toBe(true);
+		expect(classifyPromptIntent("开工吧").isStart).toBe(true);
+		expect(classifyPromptIntent("kick off").isStart).toBe(true);
 		expect(classifyPromptIntent("那先收尾吧").isWrapUp).toBe(true);
-		expect(classifyPromptIntent("先别收尾，继续看下一个问题").isWrapUp).toBe(false);
+		expect(classifyPromptIntent("好了，今天先收工").isWrapUp).toBe(true);
+		expect(classifyPromptIntent("wrap up").isWrapUp).toBe(true);
 		expect(classifyPromptIntent("好了，先这样吧").isCasualClose).toBe(true);
 		expect(classifyPromptIntent("没事了，谢谢").isCasualClose).toBe(true);
-		// Must NOT trigger casual close when user asks for more work
+		expect(classifyPromptIntent("that's all, thanks").isCasualClose).toBe(true);
+		expect(classifyPromptIntent("帮我做梦整理一下记忆").isDream).toBe(true);
+		expect(classifyPromptIntent("clue dream").isDream).toBe(true);
+		expect(classifyPromptIntent("运行一次 clue dream").isDream).toBe(true);
+		expect(classifyPromptIntent("记住以后都用中文回复").isExplicitMemoryEdit).toBe(true);
+
+		// Negations
+		expect(classifyPromptIntent("先别收尾，继续看下一个问题").isWrapUp).toBe(false);
+		expect(classifyPromptIntent("不用记住这个临时的测试路径").isExplicitMemoryEdit).toBe(false);
+
+		// Continuation prompts must NOT trigger casual close
 		expect(classifyPromptIntent("好了，接下来帮我改一下按钮样式").isCasualClose).toBe(false);
 		expect(classifyPromptIntent("可以了，顺便查一下为什么报错？").isCasualClose).toBe(false);
-		expect(classifyPromptIntent("帮我做梦整理一下记忆").isDream).toBe(true);
-		expect(classifyPromptIntent("记住以后都用中文回复").isExplicitMemoryEdit).toBe(true);
-		// Code literals and meta-questions talking about the keywords must not trigger
+
+		// Code literals, quoted mentions, and meta-questions must NOT trigger any ritual
 		expect(classifyPromptIntent("请解释 `收尾` 这个关键字在正则里的写法").isWrapUp).toBe(false);
+		expect(classifyPromptIntent("我们聊聊「开工」和「收尾」这两个机制的设计").isStart).toBe(false);
+		expect(classifyPromptIntent("我们聊聊「开工」和「收尾」这两个机制的设计").isWrapUp).toBe(false);
 		expect(classifyPromptIntent("什么开工收尾都不会影响，反而还能帮助我积累经验和记忆对吗？").isStart).toBe(false);
 		expect(classifyPromptIntent("什么开工收尾都不会影响，反而还能帮助我积累经验和记忆对吗？").isWrapUp).toBe(false);
 		expect(classifyPromptIntent("我想了解一下 clue dream 是一般怎么用的，在什么时候启用？").isDream).toBe(false);
+		expect(classifyPromptIntent("clue dream 的设计思路挺有意思的，我们继续聊架构").isDream).toBe(false);
+		expect(classifyPromptIntent("how does clue dream work?").isDream).toBe(false);
+	});
+
+	test("clue install supports dry-run and writes isolated harness configs cleanly", () => {
+		const fakeUserHome = join(tempHome, "fake-home");
+		const dry = installHarnessAdapter({ target: "agy", homeDir: fakeUserHome, dryRun: true });
+		expect(dry.ok).toBe(true);
+		expect(dry.changes.length).toBe(3);
+
+		const realAgy = installHarnessAdapter({ target: "agy", homeDir: fakeUserHome, dryRun: false });
+		expect(realAgy.ok).toBe(true);
+		expect(readFileSync(join(fakeUserHome, ".gemini", "config", "plugins", "clue", "hooks.json"), "utf8")).toContain(
+			"clue hook session-start --harness agy",
+		);
+
+		const realClaude = installHarnessAdapter({ target: "claude", homeDir: fakeUserHome, dryRun: false });
+		expect(realClaude.ok).toBe(true);
+		expect(readFileSync(join(fakeUserHome, ".claude", "settings.json"), "utf8")).toContain("PreToolUse");
 	});
 
 	test("blocks raw file edits and shell overwrites to memory files, allows clue CLI", () => {

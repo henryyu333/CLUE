@@ -34,6 +34,7 @@ import {
 	showSessionWindow,
 	type RecallHarness,
 } from "./recall/index.ts";
+import { installHarnessAdapter, type InstallTarget } from "./adapters/install.ts";
 
 const VERSION = "0.1.0";
 
@@ -115,7 +116,8 @@ Usage:
   clue log [--limit <n>]
   clue undo
   clue doctor [--json]
-  clue hook <session-start|prompt|guard> --harness <agy|claude|codex> [--with-boot]
+  clue install <agy|claude|codex|hermes> [--bin <path>] [--dry-run]
+  clue hook <session-start|prompt|guard> --harness <agy|claude|codex|hermes> [--with-boot]
   clue version
 
 Environment:
@@ -258,6 +260,25 @@ async function main(): Promise<void> {
 
 	if (cmd === "hook") {
 		await runHookCommand(positionals[1] ?? "", flags);
+		return;
+	}
+
+	if (cmd === "install") {
+		const rawTarget = (positionals[1] ?? "").toLowerCase();
+		const validTargets: InstallTarget[] = ["agy", "claude", "codex", "hermes"];
+		if (!validTargets.includes(rawTarget as InstallTarget)) {
+			console.error(`Usage: clue install <${validTargets.join("|")}> [--bin <path>] [--dry-run]`);
+			process.exit(1);
+		}
+		const res = installHarnessAdapter({
+			target: rawTarget as InstallTarget,
+			clueBin: getFlagStr(flags, "bin"),
+			dryRun: getFlagBool(flags, "dry-run"),
+		});
+		const prefix = getFlagBool(flags, "dry-run") ? "[DRY-RUN] " : "";
+		console.log(`${prefix}✅ Installed clue adapter for ${res.target}:`);
+		for (const c of res.changes) console.log(`  - ${c}`);
+		for (const n of res.notes) console.log(`\n${n}`);
 		return;
 	}
 
