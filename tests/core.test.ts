@@ -285,6 +285,7 @@ describe("intent classification & guardrails", () => {
 		expect(classifyPromptIntent("请解释 `收尾` 这个关键字在正则里的写法").isWrapUp).toBe(false);
 		expect(classifyPromptIntent("什么开工收尾都不会影响，反而还能帮助我积累经验和记忆对吗？").isStart).toBe(false);
 		expect(classifyPromptIntent("什么开工收尾都不会影响，反而还能帮助我积累经验和记忆对吗？").isWrapUp).toBe(false);
+		expect(classifyPromptIntent("我想了解一下 clue dream 是一般怎么用的，在什么时候启用？").isDream).toBe(false);
 	});
 
 	test("blocks raw file edits and shell overwrites to memory files, allows clue CLI", () => {
