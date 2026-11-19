@@ -42,7 +42,7 @@
 依赖：[Bun](https://bun.sh) `>= 1.2.0` 与 `git`。
 
 ```bash
-git clone https://github.com/henryyu333/clue.git ~/workspace/clue
+git clone https://github.com/henryyu333/CLUE.git ~/workspace/clue
 mkdir -p ~/.local/bin
 cat <<'EOF' > ~/.local/bin/clue
 #!/bin/sh
