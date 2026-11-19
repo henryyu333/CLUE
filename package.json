@@ -1,0 +1,17 @@
+{
+  "name": "clue-memory",
+  "version": "0.1.0",
+  "description": "Local-first, bounded, anti-anchoring personal memory & cross-harness recall engine for AI coding agents.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "clue": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bun x tsc --noEmit"
+  },
+  "engines": {
+    "bun": ">=1.2.0"
+  }
+}
