@@ -16,6 +16,9 @@ export interface PitfallRow {
 	evidence: string;
 	status: string;
 	superseded_by: number | null;
+	hit_count: number;
+	last_hit_at: string;
+	verified_at: string;
 	created_at: string;
 	updated_at: string;
 }
@@ -61,16 +64,28 @@ export function openPitfallDb(dbPath: string): Database {
 			evidence TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'active',
 			superseded_by INTEGER,
+			hit_count INTEGER NOT NULL DEFAULT 0,
+			last_hit_at TEXT NOT NULL DEFAULT '',
+			verified_at TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);
 	`);
 
-	// Safe in-place migration for existing DBs created before evidence column existed
+	// Safe in-place migration for existing DBs created before newer columns existed
 	let needsFtsRebuild = false;
 	if (!hasColumn(db, "pitfalls", "evidence")) {
 		db.exec("ALTER TABLE pitfalls ADD COLUMN evidence TEXT NOT NULL DEFAULT '';");
 		needsFtsRebuild = true;
+	}
+	if (!hasColumn(db, "pitfalls", "hit_count")) {
+		db.exec("ALTER TABLE pitfalls ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0;");
+	}
+	if (!hasColumn(db, "pitfalls", "last_hit_at")) {
+		db.exec("ALTER TABLE pitfalls ADD COLUMN last_hit_at TEXT NOT NULL DEFAULT '';");
+	}
+	if (!hasColumn(db, "pitfalls", "verified_at")) {
+		db.exec("ALTER TABLE pitfalls ADD COLUMN verified_at TEXT NOT NULL DEFAULT '';");
 	}
 
 	const ftsExists = Boolean(
@@ -118,11 +133,34 @@ export function exportPitfallsJsonl(db: Database, jsonlPath: string, readOnly = 
 	atomicWriteFileSync(jsonlPath, content, { readOnly });
 }
 
-export function listActivePitfalls(dbPath: string): PitfallRow[] {
+export function listActivePitfalls(dbPath: string, projectKey?: string | null): PitfallRow[] {
 	if (!existsSync(dbPath)) return [];
 	const db = openPitfallDb(dbPath);
 	try {
+		if (projectKey) {
+			return db
+				.query(
+					`SELECT * FROM pitfalls
+					 WHERE status = 'active' AND (project = ? OR project = 'global')
+					 ORDER BY (CASE WHEN project = ? THEN 0 ELSE 1 END), hit_count DESC, updated_at DESC`,
+				)
+				.all(projectKey.toLowerCase(), projectKey.toLowerCase()) as PitfallRow[];
+		}
 		return db.query("SELECT * FROM pitfalls WHERE status = 'active' ORDER BY updated_at DESC").all() as PitfallRow[];
+	} finally {
+		db.close();
+	}
+}
+
+export function recordPitfallHit(dbPath: string, ids: number[]): void {
+	if (ids.length === 0 || !existsSync(dbPath)) return;
+	const db = openPitfallDb(dbPath);
+	try {
+		const now = new Date().toISOString();
+		const stmt = db.query("UPDATE pitfalls SET hit_count = hit_count + 1, last_hit_at = ? WHERE id = ?");
+		for (const id of ids) stmt.run(now, id);
+	} catch {
+		// Never fail read path due to telemetry update
 	} finally {
 		db.close();
 	}

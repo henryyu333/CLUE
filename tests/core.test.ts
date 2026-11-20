@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	buildBootSnapshot,
+	buildProactiveFlashback,
 	buildTurnNotice,
 	checkRawEditGuard,
 	classifyPromptIntent,
@@ -11,21 +12,29 @@ import {
 	detectUnauthorizedChanges,
 	ensureClueStorage,
 	evaluateMemoryHealth,
+	formatDecisionGuidance,
 	formatPitfallGuidance,
+	getProjectIntent,
 	getReadOnlyGuardedFiles,
+	listActiveDecisions,
+	listActivePitfalls,
 	loadClueConfig,
 	lockFilesReadOnly,
 	markDreamDone,
+	mutateDecision,
 	mutatePitfall,
+	mutateProjectIntent,
 	openPitfallDb,
 	redactSecrets,
 	scanMemoryContent,
+	searchDecisions,
 	searchPitfalls,
 	undoLastMemoryCommit,
 	unlockFilesWritable,
 	type ClueConfig,
 	type CluePaths,
 } from "../src/core/index.ts";
+import { indexRecallSessions } from "../src/recall/index.ts";
 import { inspectHarnessAdapters, installHarnessAdapter } from "../src/adapters/install.ts";
 
 let tempHome: string;
@@ -510,5 +519,166 @@ describe("intent classification & guardrails", () => {
 
 		const wrapNotice = buildTurnNotice(cfgWithWf, paths, "收尾吧", projDir);
 		expect(wrapNotice).toContain("同步更新");
+	});
+});
+
+describe("v0.4 project 4-slot intent cards, decisions, continuity & proactive flashback", () => {
+	test("updates project 4-slot intent card partially without erasing untouched slots and enforces cap", () => {
+		const r1 = mutateProjectIntent(
+			config,
+			paths,
+			{
+				project: "demo",
+				goal: "打造零黑箱本地个人记忆系统",
+				approach: "纯 SQLite + Hooks + 固定槽位",
+				nonGoals: "不引入云端同步黑箱与常驻 MCP",
+				checkpoint: "完成 v0.3 地基加固",
+				evidence: "agy:conv-1",
+			},
+			"demo",
+		);
+		expect(r1.ok).toBe(true);
+		expect(r1.commit).toBeTruthy();
+
+		// Partial update touching only checkpoint preserves goal/approach/nonGoals verbatim
+		const r2 = mutateProjectIntent(
+			config,
+			paths,
+			{
+				project: "demo",
+				checkpoint: "开始测试 10ms 主动闪回",
+			},
+			"demo",
+		);
+		expect(r2.ok).toBe(true);
+		const card = getProjectIntent(paths.intentsPath, "demo");
+		expect(card?.goal).toBe("打造零黑箱本地个人记忆系统");
+		expect(card?.nonGoals).toBe("不引入云端同步黑箱与常驻 MCP");
+		expect(card?.checkpoint).toBe("开始测试 10ms 主动闪回");
+
+		// Overflow past 450 chars cap is rejected
+		const over = mutateProjectIntent(
+			config,
+			paths,
+			{
+				project: "demo",
+				goal: "长".repeat(460),
+			},
+			"demo",
+		);
+		expect(over.ok).toBe(false);
+		expect(over.message).toContain("超出硬上限");
+	});
+
+	test("manages decisions lifecycle, proactive flashback gating, hit telemetry & boot continuity", () => {
+		const d1 = mutateDecision(
+			paths,
+			{
+				op: "add",
+				project: "demo",
+				topic: "mcp-vs-hooks",
+				decision: "坚持 Hooks + CLI，不常驻 MCP",
+				rationale: "避免工具 schema 污染上下文",
+				assumptions: "当前以个人跨 7 大 CLI 为主",
+				revisitWhen: "面向 Cursor/Windsurf 大众用户时",
+				evidence: "agy:conv-2",
+			},
+			"demo",
+			config.readOnlyGuard,
+		);
+		expect(d1.ok).toBe(true);
+		expect(d1.id).toBe(1);
+
+		const dHits = searchDecisions(paths.dbPath, "MCP Hooks", "demo", 4, false);
+		expect(dHits.length).toBe(1);
+		expect(formatDecisionGuidance(dHits)).toContain("推翻条件: 面向 Cursor/Windsurf 大众用户时");
+
+		mutatePitfall(
+			paths,
+			{
+				op: "add",
+				project: "demo",
+				tags: "makensis, utf8",
+				symptom: "makensis 非交互打包崩溃 std::bad_alloc",
+				rootCause: "缺少 UTF-8 LANG/LC_ALL 导致 Unicode NSIS 脚本崩溃",
+				historicalFix: "注入 LC_ALL=en_US.UTF-8",
+				rethinkHint: "新版 makensis 如修复可移除",
+				evidence: "commit 49a38d0",
+			},
+			"demo",
+			config.readOnlyGuard,
+		);
+
+		// Short chitchat stays 100% silent
+		expect(buildProactiveFlashback(config, paths, "好的，继续", "demo").notice).toBeNull();
+		expect(buildProactiveFlashback(config, paths, "今天天气不错呀", "demo").notice).toBeNull();
+
+		// Strong technical prompt triggers crisp flashback and increments hit_count
+		const shown = new Set<string>();
+		const fb1 = buildProactiveFlashback(config, paths, "排查一下 makensis 报错 std::bad_alloc 怎么回事", "demo", shown);
+		expect(fb1.notice).toContain("Pitfall #1");
+		expect(fb1.items.length).toBe(1);
+		for (const it of fb1.items) shown.add(it.key);
+
+		// Already-shown item is deduplicated within the same session
+		const fbDup = buildProactiveFlashback(config, paths, "makensis 还是报 std::bad_alloc", "demo", shown);
+		expect(fbDup.notice).toBeNull();
+
+		// Telemetry recorded locally
+		expect(listActivePitfalls(paths.dbPath)[0]!.hit_count).toBe(1);
+
+		// Supersede decision works cleanly
+		const d2 = mutateDecision(
+			paths,
+			{
+				op: "supersede",
+				id: 1,
+				project: "demo",
+				topic: "mcp-vs-hooks",
+				decision: "默认 Hooks + CLI，提供可选 MCP 桥接",
+				rationale: "兼顾零上下文税与 IDE 生态",
+				revisitWhen: "不再维护 IDE 适配时",
+			},
+			"demo",
+			config.readOnlyGuard,
+		);
+		expect(d2.ok).toBe(true);
+		expect(listActiveDecisions(paths.dbPath, "demo").length).toBe(1);
+		expect(listActiveDecisions(paths.dbPath, "demo")[0]!.id).toBe(2);
+
+		// Seed a newer unwrapped Codex session in fake home to verify boot continuity fallback
+		const fakeUserHome = join(tempHome, "fake-recall-home");
+		const codexDir = join(fakeUserHome, ".codex", "sessions", "2026", "11", "20");
+		mkdirSync(codexDir, { recursive: true });
+		const futureTs = new Date(Date.now() + 60_000).toISOString();
+		writeFileSync(
+			join(codexDir, "rollout-later.jsonl"),
+			[
+				JSON.stringify({ timestamp: futureTs, type: "session_meta", payload: { session_id: "codex-unwrapped", cwd: "/tmp/demo" } }),
+				JSON.stringify({
+					timestamp: futureTs,
+					type: "response_item",
+					payload: { type: "message", role: "user", content: [{ type: "input_text", text: "评估网上这个新 Skill 合不合适 demo 项目" }] },
+				}),
+				JSON.stringify({
+					timestamp: futureTs,
+					type: "response_item",
+					payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "它太臃肿了，不合适。" }] },
+				}),
+			].join("\n"),
+			"utf8",
+		);
+		indexRecallSessions(paths.recallDbPath, { homeDir: fakeUserHome, harness: "codex" });
+
+		// Boot snapshot includes intent card, continuity anchor, active memory index, and omits noisy HEALTH banner
+		mutateProjectIntent(config, paths, { project: "demo", goal: "精简记忆引擎" }, "demo");
+		const snap = buildBootSnapshot(config, paths, "/tmp/demo");
+		expect(snap.block).toContain("## PROJECT INTENT (demo");
+		expect(snap.block).toContain("## RECENT UNWRAPPED SESSIONS");
+		expect(snap.block).toContain("评估网上这个新 Skill");
+		expect(snap.block).toContain("## ACTIVE MEMORY INDEX");
+		expect(snap.block).toContain("[Decision #2]");
+		expect(snap.block).toContain("[Pitfall #1]");
+		expect(snap.block).not.toContain("## HEALTH");
 	});
 });

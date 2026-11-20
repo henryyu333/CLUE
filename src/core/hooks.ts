@@ -1,11 +1,14 @@
 import { basename, resolve } from "node:path";
 import type { ClueConfig, CluePaths } from "./config.ts";
+import { listActiveDecisions } from "./decisions.ts";
 import { detectUnauthorizedChanges } from "./git.ts";
 import { evaluateMemoryHealth } from "./health.ts";
 import { classifyPromptIntent } from "./intent.ts";
+import { formatIntentCard, getProjectIntent } from "./intents.ts";
 import { readHotMemoryView } from "./markdown.ts";
-import { formatPitfallGuidance, searchPitfalls } from "./pitfalls.ts";
+import { formatPitfallGuidance, listActivePitfalls, searchPitfalls } from "./pitfalls.ts";
 import { detectProjectFile, resolveProjectKey } from "./project.ts";
+import { getRecentProjectSessionAnchors } from "../recall/store.ts";
 
 export type SupportedHarness = "agy" | "claude" | "codex" | "hermes";
 
@@ -15,8 +18,17 @@ export interface BootSnapshot {
 	profilePct: number;
 	globalChars: number;
 	projectChars: number;
+	hasIntentCard: boolean;
+	continuityCount: number;
+	activeDecisionCount: number;
+	activePitfallCount: number;
 	healthHint: string | null;
 	block: string;
+}
+
+function shortExcerpt(text: string, maxLen: number): string {
+	const flat = text.replace(/\s+/g, " ").trim();
+	return flat.length <= maxLen ? flat : `${flat.slice(0, maxLen)}…`;
 }
 
 export function buildBootSnapshot(config: ClueConfig, paths: CluePaths, cwd: string): BootSnapshot {
@@ -24,10 +36,22 @@ export function buildBootSnapshot(config: ClueConfig, paths: CluePaths, cwd: str
 	const view = readHotMemoryView(config, paths, projectKey);
 	const health = evaluateMemoryHealth(config, paths, projectKey);
 	const tampering = detectUnauthorizedChanges(paths.home);
+	const intentCard = getProjectIntent(paths.intentsPath, projectKey);
+
+	// Continuity fallback: surface 1-2 recent cross-harness sessions newer than the intent card (or latest 2 if no card yet)
+	const continuityAnchors = projectKey
+		? getRecentProjectSessionAnchors(paths.recallDbPath, projectKey, {
+				afterIso: intentCard?.updatedAt ?? null,
+				limit: 2,
+			})
+		: [];
+
+	const activeDecisions = listActiveDecisions(paths.dbPath, projectKey).slice(0, 4);
+	const activePitfalls = listActivePitfalls(paths.dbPath, projectKey).slice(0, 4);
 
 	const sections: string[] = [
-		`<clue-memory profile="${view.profileChars}/${config.limits.profileChars} chars (${view.profilePct}%)" project="${projectKey ?? "none"}">`,
-		"以下为用户的长期个人画像与当前项目偏好（只读冻结快照；与当前明确指令或仓库实况冲突时以当前为准）。平时静默只读、绝不偷写记忆；遇到历史报错或疑难排障可按需运行 `clue search \"<关键词>\"` 查踩坑线索。",
+		`<clue-memory project="${projectKey ?? "none"}">`,
+		"以下为用户的本地背景、当前项目意图与跨工具记忆索引（只读冻结快照；与当前明确指令或仓库实况冲突时以当前为准）。平时静默只读、绝不偷写；查老坑/老决定用 `clue search \"<词>\"`，翻过往原话用 `clue recall \"<词>\"` / `clue show <id>`。",
 	];
 	if (tampering.dirty) {
 		sections.push(
@@ -35,13 +59,31 @@ export function buildBootSnapshot(config: ClueConfig, paths: CluePaths, cwd: str
 		);
 	}
 	if (view.profileRaw.trim()) {
-		sections.push(`## PROFILE\n${view.profileRaw.trim()}`);
+		sections.push(`## BACKGROUND & TASTE\n${view.profileRaw.trim()}`);
+	}
+	if (intentCard) {
+		sections.push(`## PROJECT INTENT (${intentCard.project} · ${intentCard.updatedAt.slice(0, 10)})\n${formatIntentCard(intentCard)}`);
 	}
 	if (view.scoped.text) {
 		sections.push(`## PROJECTS\n${view.scoped.text}`);
 	}
-	if (health.hint) {
-		sections.push(`## HEALTH\n${health.hint}`);
+	if (continuityAnchors.length > 0) {
+		const anchorLines = continuityAnchors.map(a => {
+			const shortId = a.id.length > 22 ? a.id.slice(0, 22) : a.id;
+			const tail = a.lastUserMsg && a.lastUserMsg !== a.firstUserMsg ? ` → 末句：「${shortExcerpt(a.lastUserMsg, 56)}」` : "";
+			return `- [${a.updatedAt.slice(5, 16).replace("T", " ")} | ${a.harness} | ${shortId}] 「${shortExcerpt(a.firstUserMsg, 64)}」${tail}`;
+		});
+		sections.push(`## RECENT UNWRAPPED SESSIONS (跨工具自动兜底)\n${anchorLines.join("\n")}`);
+	}
+	if (activeDecisions.length > 0 || activePitfalls.length > 0) {
+		const idxLines: string[] = [];
+		for (const d of activeDecisions) {
+			idxLines.push(`- [Decision #${d.id}${d.project === "global" ? " · global" : ""}] ${shortExcerpt(d.decision, 76)}`);
+		}
+		for (const p of activePitfalls) {
+			idxLines.push(`- [Pitfall #${p.id}${p.project === "global" ? " · global" : ""}] ${shortExcerpt(p.root_cause, 76)}`);
+		}
+		sections.push(`## ACTIVE MEMORY INDEX (1行目录，详情按需 clue search)\n${idxLines.join("\n")}`);
 	}
 	sections.push("</clue-memory>");
 
@@ -51,6 +93,10 @@ export function buildBootSnapshot(config: ClueConfig, paths: CluePaths, cwd: str
 		profilePct: view.profilePct,
 		globalChars: view.scoped.globalChars,
 		projectChars: view.scoped.projectChars,
+		hasIntentCard: Boolean(intentCard),
+		continuityCount: continuityAnchors.length,
+		activeDecisionCount: activeDecisions.length,
+		activePitfallCount: activePitfalls.length,
 		healthHint: health.hint,
 		block: sections.join("\n\n"),
 	};

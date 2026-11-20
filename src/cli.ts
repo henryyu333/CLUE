@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
 	buildBootSnapshot,
 	buildDreamPacket,
+	buildProactiveFlashback,
 	buildTurnNotice,
 	checkRawEditGuard,
 	curateHotMemory,
@@ -15,20 +16,31 @@ import {
 	formatAgyPreInvocation,
 	formatAgySessionStart,
 	formatClaudeHookOutput,
+	formatDecisionGuidance,
+	formatIntentCard,
 	formatPitfallGuidance,
+	getProjectIntent,
 	getReadOnlyGuardedFiles,
 	getRecentMemoryCommits,
+	listActiveDecisions,
+	listActivePitfalls,
 	loadClueConfig,
 	lockFilesReadOnly,
 	markDreamDone,
+	mutateDecision,
 	mutatePitfall,
+	mutateProjectIntent,
+	openDecisionDb,
 	openPitfallDb,
 	readHotMemoryView,
 	resolveProjectKey,
+	searchDecisions,
 	searchPitfalls,
 	undoLastMemoryCommit,
 	unlockFilesWritable,
 	type CurateRequest,
+	type DecisionMutationRequest,
+	type IntentMutationRequest,
 	type PitfallMutationRequest,
 } from "./core/index.ts";
 import {
@@ -40,7 +52,7 @@ import {
 } from "./recall/index.ts";
 import { inspectHarnessAdapters, installHarnessAdapter, type InstallTarget } from "./adapters/install.ts";
 
-const VERSION = "0.3";
+const VERSION = "0.4";
 
 function parseArgs(argv: string[]): { positionals: string[]; flags: Record<string, string | boolean> } {
 	const positionals: string[] = [];
@@ -127,6 +139,31 @@ function wasHookTurnSeen(scopeKey: string, turnFingerprint: string): boolean {
 	return false;
 }
 
+function readShownFlashbackKeys(scopeKey: string): Set<string> {
+	try {
+		const dir = join(tmpdir(), "clue-hook-dedup");
+		const file = join(dir, `fb-${createHash("sha1").update(scopeKey).digest("hex").slice(0, 16)}.json`);
+		if (existsSync(file)) {
+			const parsed = JSON.parse(readFileSync(file, "utf8")) as { keys?: string[] };
+			if (Array.isArray(parsed.keys)) return new Set(parsed.keys);
+		}
+	} catch {
+		// ignore
+	}
+	return new Set();
+}
+
+function saveShownFlashbackKeys(scopeKey: string, keys: ReadonlySet<string>): void {
+	try {
+		const dir = join(tmpdir(), "clue-hook-dedup");
+		mkdirSync(dir, { recursive: true });
+		const file = join(dir, `fb-${createHash("sha1").update(scopeKey).digest("hex").slice(0, 16)}.json`);
+		writeFileSync(file, JSON.stringify({ keys: [...keys].slice(-64), ts: Date.now() }), "utf8");
+	} catch {
+		// ignore
+	}
+}
+
 function printHelp(): void {
 	console.log(`clue v${VERSION} — Local-first, bounded, anti-anchoring personal memory CLI
 
@@ -134,7 +171,9 @@ Usage:
   clue boot [--cwd <dir>] [--format text|agy|claude|json]
   clue view [--cwd <dir>] [--json]
   clue status [--cwd <dir>] [--json]
-  clue search [query] [--project <key>] [--limit <1-10>] [--all] [--json]
+  clue search [query] [--type all|pitfall|decision] [--project <key>] [--limit <1-10>] [--all] [--json]
+  clue intent [--project <key>] [--dry-run]      (view card, or stdin JSON to update 4 slots)
+  clue decision [--cwd <dir>]                    (reads JSON payload from stdin)
   clue recall [query] [--harness <name>] [--project <key>] [--role user|assistant] [--since 30d] [--limit 8] [--no-refresh] [--json]
   clue show <id-prefix> [--around <seq>] [--window 4] [--offset 0] [--limit 12] [--full] [--json]
   clue index [--harness <name>] [--rebuild] [--quiet] [--json]
@@ -218,6 +257,21 @@ async function runHookCommand(sub: string, flags: Record<string, string | boolea
 			}
 		}
 		if (notice) blocks.push(notice);
+
+		// Pure-local (<15ms) high-confidence flashback for ordinary technical turns (deduplicated per session)
+		if (!notice && config.autoRecall && promptText.trim()) {
+			const projKey = resolveProjectKey(cwd, config.workspaceRoots);
+			const fbScope = convId ? `fb:${harness}:${convId}` : "";
+			const shown = fbScope ? readShownFlashbackKeys(fbScope) : new Set<string>();
+			const fb = buildProactiveFlashback(config, paths, promptText, projKey, shown, convId || undefined);
+			if (fb.notice) {
+				blocks.push(fb.notice);
+				if (fbScope) {
+					for (const item of fb.items) shown.add(item.key);
+					saveShownFlashbackKeys(fbScope, shown);
+				}
+			}
+		}
 
 		const combined = blocks.length > 0 ? blocks.join("\n\n") : null;
 		if (harness === "agy") {
@@ -346,10 +400,33 @@ async function main(): Promise<void> {
 		const view = readHotMemoryView(config, paths, projectKey);
 		const health = evaluateMemoryHealth(config, paths, projectKey);
 		const tampering = detectUnauthorizedChanges(paths.home);
+		const intentCard = getProjectIntent(paths.intentsPath, projectKey);
+		const allActivePitfalls = listActivePitfalls(paths.dbPath);
+		const allActiveDecisions = listActiveDecisions(paths.dbPath);
 		const pitfalls = searchPitfalls(paths.dbPath, positionals.slice(1).join(" "), projectKey, 5, false);
+		const decisions = searchDecisions(paths.dbPath, positionals.slice(1).join(" "), projectKey, 5, false);
 		const commits = getRecentMemoryCommits(paths.home, 4);
+		const totalHits =
+			allActivePitfalls.reduce((acc, p) => acc + (p.hit_count || 0), 0) +
+			allActiveDecisions.reduce((acc, d) => acc + (d.hit_count || 0), 0);
 		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify({ home: paths.home, projectKey, health, tampering, recentPitfalls: pitfalls, commits }, null, 2));
+			console.log(
+				JSON.stringify(
+					{
+						home: paths.home,
+						projectKey,
+						health,
+						tampering,
+						intentCard,
+						totalHits,
+						recentDecisions: decisions,
+						recentPitfalls: pitfalls,
+						commits,
+					},
+					null,
+					2,
+				),
+			);
 			return;
 		}
 		const m = health.metrics;
@@ -361,11 +438,23 @@ async function main(): Promise<void> {
 				: []),
 			`- PROFILE.md：${m.profileChars} / ${m.profileLimit} 字 (${m.profilePct}%)`,
 			`- PROJECTS.md：全局 ${m.globalChars} / ${m.globalLimit} 字 (${m.globalPct}%) | 当前项目 (${projectKey ?? "无"}) ${view.scoped.projectChars} / ${config.limits.singleProjectChars} 字 (${projPct}%)`,
-			`- 活跃踩坑：${m.activePitfalls} 条（缺少溯源 ${m.pitfallsWithoutEvidence} 条）`,
+			`- 项目 4 格意图卡 (${projectKey ?? "无"})：${intentCard ? `已建立（更新于 ${intentCard.updatedAt.slice(0, 16)}）` : "尚未建立"}`,
+			...(intentCard ? formatIntentCard(intentCard).split("\n").map(l => `  ${l}`) : []),
+			`- 活跃记忆：踩坑 ${allActivePitfalls.length} 条（缺溯源 ${m.pitfallsWithoutEvidence} 条） | 关键决定 ${allActiveDecisions.length} 条 | 累计自动闪回命中 ${totalHits} 次`,
 			`- 健康状态：${health.status === "healthy" ? "健康" : `需留意（${health.reasons.join("；")}）`}`,
+			`- 最近关键决定：`,
+			...(decisions.length > 0
+				? decisions.map(
+						d =>
+							`  • #${d.id} [${d.project}] ${d.decision}${d.hit_count > 0 ? ` (命中 ${d.hit_count} 次)` : ""}${d.evidence ? `（溯源: ${d.evidence}）` : ""}`,
+					)
+				: ["  • (暂无记录)"]),
 			`- 最近踩坑线索：`,
 			...(pitfalls.length > 0
-				? pitfalls.map(p => `  • #${p.id} [${p.project}] ${p.symptom} → 根因：${p.root_cause}${p.evidence ? `（溯源: ${p.evidence}）` : ""}`)
+				? pitfalls.map(
+						p =>
+							`  • #${p.id} [${p.project}] ${p.symptom} → 根因：${p.root_cause}${p.hit_count > 0 ? ` (命中 ${p.hit_count} 次)` : ""}${p.evidence ? `（溯源: ${p.evidence}）` : ""}`,
+					)
 				: ["  • (暂无记录)"]),
 			`- 最近版本记录：`,
 			...(commits.length > 0 ? commits.map(c => `  ${c}`) : ["  (暂无提交)"]),
@@ -378,13 +467,85 @@ async function main(): Promise<void> {
 		const query = positionals.slice(1).join(" ").trim();
 		const limRaw = Number.parseInt(getFlagStr(flags, "limit") ?? "4", 10);
 		const limit = Math.max(1, Math.min(10, Number.isFinite(limRaw) ? limRaw : 4));
-		const includeSuperseded = getFlagBool(flags, "all");
-		const rows = searchPitfalls(paths.dbPath, query, projectKey, limit, includeSuperseded);
+		const includeInactive = getFlagBool(flags, "all");
+		const searchType = (getFlagStr(flags, "type") ?? "all").toLowerCase();
+		const pitfallRows =
+			searchType === "decision" ? [] : searchPitfalls(paths.dbPath, query, projectKey, limit, includeInactive);
+		const decisionRows =
+			searchType === "pitfall" ? [] : searchDecisions(paths.dbPath, query, projectKey, limit, includeInactive);
 		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify({ query, project: projectKey, count: rows.length, rows }, null, 2));
+			console.log(
+				JSON.stringify(
+					{
+						query,
+						project: projectKey,
+						type: searchType,
+						pitfalls: pitfallRows,
+						decisions: decisionRows,
+						count: pitfallRows.length + decisionRows.length,
+						rows: pitfallRows,
+					},
+					null,
+					2,
+				),
+			);
 		} else {
-			console.log(formatPitfallGuidance(rows));
+			const parts: string[] = [];
+			if (searchType !== "pitfall" && decisionRows.length > 0) {
+				parts.push(formatDecisionGuidance(decisionRows));
+			}
+			if (searchType !== "decision" && pitfallRows.length > 0) {
+				parts.push(formatPitfallGuidance(pitfallRows));
+			}
+			console.log(parts.length > 0 ? parts.join("\n\n") : "未检索到匹配的历史踩坑或关键决定。");
 		}
+		return;
+	}
+
+	if (cmd === "intent") {
+		const raw = await readStdinText();
+		let req: IntentMutationRequest;
+		if (!raw) {
+			req = { op: "view", project: getFlagStr(flags, "project") ?? projectKey ?? undefined };
+		} else {
+			try {
+				req = JSON.parse(raw) as IntentMutationRequest;
+			} catch (e) {
+				console.error(`stdin JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
+				process.exit(1);
+			}
+		}
+		if (getFlagBool(flags, "dry-run")) req.dryRun = true;
+		const res = mutateProjectIntent(config, paths, req, projectKey);
+		if (!res.ok) {
+			console.error(res.message);
+			process.exit(1);
+		}
+		console.log(res.message);
+		return;
+	}
+
+	if (cmd === "decision") {
+		const raw = await readStdinText();
+		if (!raw) {
+			console.error(
+				'clue decision 需要从 stdin 传入 JSON 请求，例如：clue decision <<\'EOF\'\n{"op":"add","topic":"architecture","decision":"...","rationale":"...","assumptions":"...","revisitWhen":"...","evidence":"..."}\nEOF',
+			);
+			process.exit(1);
+		}
+		let req: DecisionMutationRequest;
+		try {
+			req = JSON.parse(raw) as DecisionMutationRequest;
+		} catch (e) {
+			console.error(`stdin JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
+			process.exit(1);
+		}
+		const res = mutateDecision(paths, req, projectKey, config.readOnlyGuard);
+		if (!res.ok) {
+			console.error(res.message);
+			process.exit(1);
+		}
+		console.log(res.message);
 		return;
 	}
 
@@ -612,9 +773,12 @@ async function main(): Promise<void> {
 			const db = openPitfallDb(paths.dbPath);
 			const cnt = (db.query("SELECT COUNT(*) as c FROM pitfalls").get() as { c: number }).c;
 			db.close();
-			checks.push({ name: "SQLite FTS5 pitfalls.db", ok: true, detail: `${cnt} total rows` });
+			const ddb = openDecisionDb(paths.dbPath);
+			const dcnt = (ddb.query("SELECT COUNT(*) as c FROM decisions").get() as { c: number }).c;
+			ddb.close();
+			checks.push({ name: "SQLite FTS5 pitfalls+decisions", ok: true, detail: `${cnt} pitfalls, ${dcnt} decisions` });
 		} catch (e) {
-			checks.push({ name: "SQLite FTS5 pitfalls.db", ok: false, detail: String(e) });
+			checks.push({ name: "SQLite FTS5 pitfalls+decisions", ok: false, detail: String(e) });
 		}
 
 		const adapters = getFlagBool(flags, "adapters") ? inspectHarnessAdapters() : undefined;
