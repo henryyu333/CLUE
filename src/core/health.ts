@@ -1,9 +1,13 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import type { ClueConfig, CluePaths } from "./config.ts";
+import { listActiveDecisions, type DecisionRow } from "./decisions.ts";
 import { countCommitsSince, getRecentMemoryCommits } from "./git.ts";
+import { formatIntentCard, readIntentStore } from "./intents.ts";
 import { atomicWriteFileSync } from "./lock.ts";
 import { parseSectionedMarkdown, readHotMemoryView } from "./markdown.ts";
-import { listActivePitfalls } from "./pitfalls.ts";
+import { listActivePitfalls, type PitfallRow } from "./pitfalls.ts";
 
 export interface ClueMeta {
 	lastDreamAt?: string | null;
@@ -17,6 +21,25 @@ export interface DuplicateCandidate {
 	sectionB: string;
 	entryB: string;
 	similarity: number;
+}
+
+export interface EvidenceCheckItem {
+	kind: "pitfall" | "decision";
+	id: number;
+	project: string;
+	summary: string;
+	evidence: string;
+	status: "valid" | "stale-file-missing" | "stale-file-changed" | "unverifiable";
+	detail: string;
+}
+
+export interface ColdMemoryItem {
+	kind: "pitfall" | "decision";
+	id: number;
+	project: string;
+	summary: string;
+	ageDays: number;
+	hitCount: number;
 }
 
 export interface MemoryHealthReport {
@@ -34,9 +57,15 @@ export interface MemoryHealthReport {
 		maxProjectHeading: string | null;
 		activePitfalls: number;
 		pitfallsWithoutEvidence: number;
+		activeDecisions: number;
+		decisionsWithoutEvidence: number;
+		totalHits: number;
+		staleEvidenceCount: number;
 		daysSinceDream: number | null;
 		writesSinceDream: number;
 		duplicateCandidates: DuplicateCandidate[];
+		evidenceChecks: EvidenceCheckItem[];
+		coldItems: ColdMemoryItem[];
 	};
 }
 
@@ -111,10 +140,86 @@ function findDuplicateCandidates(
 	return hits;
 }
 
+function resolveRepoRoot(cwd?: string): string | null {
+	if (!cwd) return null;
+	const resolved = resolve(cwd);
+	try {
+		const commonDir = execFileSync("git", ["-C", resolved, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		if (commonDir && basename(commonDir) === ".git") {
+			return dirname(commonDir);
+		}
+	} catch {
+		// fall back to cwd directly
+	}
+	return resolved;
+}
+
+/**
+ * Zero-token local verification of file paths and git commits referenced in `evidence`.
+ */
+export function verifyEvidenceAnchor(
+	evidence: string,
+	cwd?: string,
+): { status: EvidenceCheckItem["status"]; detail: string } {
+	const raw = evidence.trim();
+	if (!raw) return { status: "unverifiable", detail: "无溯源锚点" };
+
+	const repoRoot = resolveRepoRoot(cwd);
+	if (!repoRoot) return { status: "unverifiable", detail: "未提供仓库目录" };
+
+	// Extract relative file path like src/core/lock.ts#L1-L40 or cmd/app/main.go
+	const pathMatch = raw.match(/\b((?:[a-zA-Z0-9_.-]+\/)+[a-zA-Z0-9_.-]+\.[a-zA-Z0-9]{1,8})(?:#L\d+(?:-L?\d+)?)?\b/);
+	const commitMatch = raw.match(/\bcommit\s+([0-9a-f]{7,40})\b/i);
+
+	if (pathMatch) {
+		const relPath = pathMatch[1]!;
+		const absPath = join(repoRoot, relPath);
+		if (!existsSync(absPath)) {
+			return { status: "stale-file-missing", detail: `溯源文件已不存在：${relPath}` };
+		}
+		if (commitMatch) {
+			const sha = commitMatch[1]!;
+			try {
+				execFileSync("git", ["-C", repoRoot, "cat-file", "-e", `${sha}^{commit}`], { stdio: "ignore" });
+				const countOut = execFileSync("git", ["-C", repoRoot, "rev-list", "--count", `${sha}..HEAD`, "--", relPath], {
+					encoding: "utf8",
+					stdio: ["ignore", "pipe", "ignore"],
+				}).trim();
+				const commitsAfter = Number.parseInt(countOut, 10);
+				if (Number.isFinite(commitsAfter) && commitsAfter >= 8) {
+					return {
+						status: "stale-file-changed",
+						detail: `溯源文件 ${relPath} 在 ${sha} 之后已历经 ${commitsAfter} 次提交，建议核实是否仍成立`,
+					};
+				}
+			} catch {
+				// commit may belong to another repo; file still exists
+			}
+		}
+		return { status: "valid", detail: `文件仍在：${relPath}` };
+	}
+
+	if (commitMatch) {
+		const sha = commitMatch[1]!;
+		try {
+			execFileSync("git", ["-C", repoRoot, "cat-file", "-e", `${sha}^{commit}`], { stdio: "ignore" });
+			return { status: "valid", detail: `commit ${sha} 在当前仓库有效` };
+		} catch {
+			return { status: "unverifiable", detail: `commit ${sha} 不在当前仓库（可能属于其他项目）` };
+		}
+	}
+
+	return { status: "unverifiable", detail: "非文件路径/commit 溯源（如会话编号）" };
+}
+
 export function evaluateMemoryHealth(
 	config: ClueConfig,
 	paths: CluePaths,
 	projectKey: string | null,
+	cwd?: string,
 ): MemoryHealthReport {
 	const view = readHotMemoryView(config, paths, projectKey);
 	const globalPct = Math.round((view.scoped.globalChars / config.limits.globalProjectChars) * 100);
@@ -130,8 +235,46 @@ export function evaluateMemoryHealth(
 		}
 	}
 
-	const pitfalls = listActivePitfalls(paths.dbPath);
+	const pitfalls: PitfallRow[] = listActivePitfalls(paths.dbPath);
+	const decisions: DecisionRow[] = listActiveDecisions(paths.dbPath);
 	const pitfallsWithoutEvidence = pitfalls.filter(p => !p.evidence?.trim()).length;
+	const decisionsWithoutEvidence = decisions.filter(d => !d.evidence?.trim()).length;
+	const totalHits =
+		pitfalls.reduce((acc, p) => acc + (p.hit_count || 0), 0) +
+		decisions.reduce((acc, d) => acc + (d.hit_count || 0), 0);
+
+	const evidenceChecks: EvidenceCheckItem[] = [];
+	const coldItems: ColdMemoryItem[] = [];
+	const nowMs = Date.now();
+
+	const inspectItem = (
+		kind: "pitfall" | "decision",
+		id: number,
+		project: string,
+		summary: string,
+		evidence: string,
+		updatedAt: string,
+		hitCount: number,
+	) => {
+		const isCurrentOrGlobal = !projectKey || project === "global" || project === projectKey.toLowerCase();
+		if (cwd && evidence.trim() && isCurrentOrGlobal) {
+			const res = verifyEvidenceAnchor(evidence, cwd);
+			if (res.status === "stale-file-missing" || res.status === "stale-file-changed") {
+				evidenceChecks.push({ kind, id, project, summary, evidence, status: res.status, detail: res.detail });
+			}
+		}
+		const ageDays = Math.max(0, Math.floor((nowMs - new Date(updatedAt).getTime()) / (86400 * 1000)));
+		if (hitCount === 0 && ageDays >= 60) {
+			coldItems.push({ kind, id, project, summary, ageDays, hitCount });
+		}
+	};
+
+	for (const p of pitfalls) {
+		inspectItem("pitfall", p.id, p.project, p.symptom, p.evidence, p.updated_at, p.hit_count || 0);
+	}
+	for (const d of decisions) {
+		inspectItem("decision", d.id, d.project, d.decision, d.evidence, d.updated_at, d.hit_count || 0);
+	}
 
 	const meta = readClueMeta(paths);
 	const lastDreamAt = meta.lastDreamAt ?? null;
@@ -164,6 +307,9 @@ export function evaluateMemoryHealth(
 	if (duplicateCandidates.length > 0) {
 		reasons.push(`检测到 ${duplicateCandidates.length} 组疑似重复条目`);
 	}
+	if (evidenceChecks.length > 0) {
+		reasons.push(`检测到 ${evidenceChecks.length} 条记忆溯源疑似过期`);
+	}
 
 	const status = reasons.length > 0 ? "attention" : "healthy";
 	const hint =
@@ -186,35 +332,82 @@ export function evaluateMemoryHealth(
 			maxProjectHeading,
 			activePitfalls: pitfalls.length,
 			pitfallsWithoutEvidence,
+			activeDecisions: decisions.length,
+			decisionsWithoutEvidence,
+			totalHits,
+			staleEvidenceCount: evidenceChecks.length,
 			daysSinceDream,
 			writesSinceDream,
 			duplicateCandidates,
+			evidenceChecks,
+			coldItems,
 		},
 	};
 }
 
-export function buildDreamPacket(config: ClueConfig, paths: CluePaths, projectKey: string | null): string {
-	const health = evaluateMemoryHealth(config, paths, projectKey);
+export function buildDreamPacket(
+	config: ClueConfig,
+	paths: CluePaths,
+	projectKey: string | null,
+	cwd?: string,
+): string {
+	const health = evaluateMemoryHealth(config, paths, projectKey, cwd);
 	const view = readHotMemoryView(config, paths, projectKey);
+	const intentStore = readIntentStore(paths.intentsPath);
 	const pitfalls = listActivePitfalls(paths.dbPath);
+	const decisions = listActiveDecisions(paths.dbPath);
 	const recentCommits = getRecentMemoryCommits(paths.home, 12);
 
+	const intentKeys = Object.keys(intentStore).sort();
 	const lines: string[] = [
-		"=== CLUE DREAM（记忆健康体检与深度整理材料）===",
+		"=== CLUE DREAM（记忆健康体检与防腐烂整理材料）===",
 		`状态: ${health.status === "healthy" ? "健康" : "建议整理"}`,
 		...(health.reasons.length > 0 ? [`触发信号: ${health.reasons.join("；")}`] : ["触发信号: 无明显超标（可做常规瘦身与纠错）"]),
-		`水位: PROFILE ${health.metrics.profileChars}/${health.metrics.profileLimit} (${health.metrics.profilePct}%) | 全局工程 ${health.metrics.globalChars}/${health.metrics.globalLimit} (${health.metrics.globalPct}%) | 活跃踩坑 ${health.metrics.activePitfalls} 条（缺溯源 ${health.metrics.pitfallsWithoutEvidence} 条）`,
+		`指标: PROFILE ${health.metrics.profileChars}/${health.metrics.profileLimit} (${health.metrics.profilePct}%) | 意图卡 ${intentKeys.length} 个 | 活跃决定 ${health.metrics.activeDecisions} 条 | 活跃踩坑 ${health.metrics.activePitfalls} 条 | 累计自动闪回 ${health.metrics.totalHits} 次 | 疑似过期溯源 ${health.metrics.staleEvidenceCount} 条`,
 		"",
 		view.formatted,
+		"",
+		"=== 项目 4 格意图卡清单 ===",
+		...(intentKeys.length > 0
+			? intentKeys.map(k => `[${k} · 更新 ${intentStore[k]!.updatedAt.slice(0, 10)}]\n${formatIntentCard(intentStore[k]!)}`)
+			: ["(暂无)"]),
+		"",
+		"=== 活跃关键决定清单 ===",
+		...(decisions.length > 0
+			? decisions.map(
+					d =>
+						`- #${d.id} [${d.project}] 决定: ${d.decision} | 原因: ${d.rationale}${d.revisit_when ? ` | 推翻条件: ${d.revisit_when}` : ""} | 命中 ${d.hit_count || 0} 次${d.evidence ? ` | 溯源: ${d.evidence}` : " | (无溯源)"}`,
+				)
+			: ["(暂无)"]),
 		"",
 		"=== 活跃踩坑清单 ===",
 		...(pitfalls.length > 0
 			? pitfalls.map(
 					p =>
-						`- #${p.id} [${p.project}] 现象: ${p.symptom} | 根因: ${p.root_cause}${p.evidence ? ` | 溯源: ${p.evidence}` : " | (无溯源)"}`,
+						`- #${p.id} [${p.project}] 现象: ${p.symptom} | 根因: ${p.root_cause} | 命中 ${p.hit_count || 0} 次${p.evidence ? ` | 溯源: ${p.evidence}` : " | (无溯源)"}`,
 				)
 			: ["(暂无)"]),
 	];
+
+	if (health.metrics.evidenceChecks.length > 0) {
+		lines.push(
+			"",
+			"=== ⚠️ 溯源疑似过期告警（自动核验） ===",
+			...health.metrics.evidenceChecks.map(
+				e => `- [${e.kind} #${e.id} | ${e.project}] ${e.summary} -> ${e.detail}（原溯源：${e.evidence}）`,
+			),
+		);
+	}
+
+	if (health.metrics.coldItems.length > 0) {
+		lines.push(
+			"",
+			"=== 长期 0 命中冷门条目（>=60 天未命中） ===",
+			...health.metrics.coldItems.map(
+				c => `- [${c.kind} #${c.id} | ${c.project}] ${c.summary}（已存放 ${c.ageDays} 天，0 命中）`,
+			),
+		);
+	}
 
 	if (health.metrics.duplicateCandidates.length > 0) {
 		lines.push(
@@ -233,8 +426,8 @@ export function buildDreamPacket(config: ClueConfig, paths: CluePaths, projectKe
 	lines.push(
 		"",
 		"【做梦整理输出要求】",
-		"1. 重点检查四件事：(a) 有无过时或互相冲突的条目；(b) 有无可以合并精简的重复项；(c) 有无应冷热升降级的条目（把一次性坑点沉进 pitfalls，把高频通用原则提炼进热层）；(d) 踩坑记录是否缺 `evidence` 溯源或已有更优解法。",
-		"2. 严禁擅自直接写入！请先向用户输出一份清晰编号的「做梦整理提案草稿」（列出删/并/改哪条、预计字数变化），等用户批复后再通过 `clue curate` / `clue pitfall` 落盘，最后运行 `clue dream --mark-done` 刷新健康周期。",
+		"1. 重点检查四件事：(a) 有无溯源失效、过时或互相冲突的条目；(b) 有无把静态工作纪律误放进 PROFILE.md 的条目；(c) 项目 4 格意图卡是否与最新代码现状一致；(d) 长期 0 命中的条目是否值得精简或淘汰。",
+		"2. 修改个人名片或删除旧记录前，先向用户输出清晰编号的「整理提案草稿」（含前后对比），等用户批复后再落盘并运行 `clue dream --mark-done`。",
 	);
 
 	return lines.join("\n");

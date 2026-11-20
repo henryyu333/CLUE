@@ -8,6 +8,7 @@ export * from "./intents.ts";
 export * from "./pitfalls.ts";
 export * from "./decisions.ts";
 export * from "./flashback.ts";
+export * from "./export.ts";
 export * from "./intent.ts";
 export * from "./health.ts";
 export * from "./hooks.ts";

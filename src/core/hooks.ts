@@ -120,7 +120,7 @@ export function buildTurnNotice(
 		return null;
 	}
 
-	const projectKey = resolveProjectKey(cwd);
+	const projectKey = resolveProjectKey(cwd, config.workspaceRoots);
 	const matchedWorkflows = config.projectWorkflows
 		.map(wf => {
 			const hit = detectProjectFile(cwd, wf.detectFile);
@@ -130,7 +130,7 @@ export function buildTurnNotice(
 	const renderHint = (tpl: string, hit: { file: string; dir: string }) =>
 		tpl.replaceAll("{dir}", hit.dir).replaceAll("{file}", hit.file);
 
-	const health = evaluateMemoryHealth(config, paths, projectKey);
+	const health = evaluateMemoryHealth(config, paths, projectKey, cwd);
 	const notices: string[] = [];
 
 	if (intent.isStart) {
@@ -138,7 +138,7 @@ export function buildTurnNotice(
 		const hits = cleanQuery ? searchPitfalls(paths.dbPath, cleanQuery, projectKey, 3, false) : [];
 		const startLines = [
 			"【clue 开工预热】",
-			"- 已载入用户的 `PROFILE.md` 与当前项目偏好快照。",
+			"- 已载入用户的背景眼光名片、当前项目意图卡与活跃记忆索引。",
 		];
 		for (const { wf, hit } of matchedWorkflows) {
 			if (wf.startHint) {
@@ -148,7 +148,7 @@ export function buildTurnNotice(
 		if (hits.length > 0) {
 			startLines.push("", formatPitfallGuidance(hits));
 		} else {
-			startLines.push("- 排障遇到棘手报错或模块怪癖时，可随时运行 `clue search \"<关键词>\"` 查跨项目踩坑线索。");
+			startLines.push("- 排障或回溯历史方案时，可随时运行 `clue search \"<关键词>\"` 或 `clue recall \"<关键词>\"`。");
 		}
 		notices.push(startLines.join("\n"));
 	}
@@ -157,15 +157,15 @@ export function buildTurnNotice(
 		notices.push(
 			[
 				"【clue 做梦体检模式】",
-				"用户请求对个人记忆做一次深度整理体检：",
-				"1. 先运行 `clue dream` 读取完整健康报告、水位、疑似重复项与活跃踩坑清单；",
-				"2. 如有必要，结合近期代码/Git 状态核对哪些条目已经过时或失真；",
-				"3. **严禁直接写入**！先向用户输出一份清晰编号的「做梦整理提案草稿」（合并/淘汰/升降级/补溯源），等用户逐条或整体批复后，再用 `clue curate` / `clue pitfall` 落盘并执行 `clue dream --mark-done`。",
+				"用户请求对个人记忆做一次深度防腐烂体检：",
+				"1. 先运行 `clue dream` 读取完整健康报告、意图卡、疑似过期溯源、冷门条目与重复项；",
+				"2. 如有必要，结合近期代码/Git 状态核对哪些条目已过时或失真；",
+				"3. **严禁直接改动核心名片或批量删旧条目**！先向用户输出清晰编号的「体检提案草稿」（含前后对比），等用户批复后再通过 `clue` 落盘并执行 `clue dream --mark-done`。",
 			].join("\n"),
 		);
 	} else if (intent.isWrapUp) {
 		const wrapLines = [
-			"【clue 收尾复盘契约（统一草稿确认制）】",
+			"【clue 收尾沉淀契约（固定槽位分级落盘 + 透明回执）】",
 			"用户已发出「收尾 / 收工」口令，请按以下顺序执行：",
 		];
 		let step = 1;
@@ -176,36 +176,29 @@ export function buildTurnNotice(
 			}
 		}
 		wrapLines.push(
-			`${step}. **盘点个人记忆与踩坑（宁缺毋滥，严禁偷写）**：回顾本次会话${compactionLessonsCount > 0 ? "（含压缩摘要中的待沉淀线索）" : ""}是否有用户新定下的长期偏好、纠正过你的做法、跨会话项目约定，或非显而易见的客观 Bug 根因。`,
-			`   - **若无新知**：直接明确告知「本次无新增长期记忆」并附当前水位即可，绝不硬凑废话。`,
-			`   - **若有值得记住的**：先运行 \`clue view\` 核对原文，**不要直接落盘！**先向用户贴出一份极简清晰的「记忆修改草稿」（准备改 PROFILE 还是 PROJECTS、具体增/改/并哪条，或要记哪个坑的现象/客观根因/当时解法/重思提示/evidence 溯源），等用户确认后再调用 \`clue curate\` / \`clue pitfall\` 落盘并汇报最新水位。`,
-			`   - 禁止直接用文件编辑工具修改 \`${paths.home}\` 下的记忆文件。`,
+			`${step}. **按风险分级沉淀本次记忆（宁缺毋滥，严禁直接编辑文件）**：回顾本次会话${compactionLessonsCount > 0 ? "（含压缩摘要中的线索）" : ""}是否有新的项目进展/取舍、客观 Bug 根因，或长期个人背景变化。`,
+			`   - **低风险日常沉淀（可直接落盘 + 必须亮回执）**：若本项目目标/已定思路/明确不做/当前停点有变化，用 \`clue intent\` **只更新变动的槽位**（未变槽位不要动）；若有新踩坑或新关键决定，分别用 \`clue pitfall\` / \`clue decision\` 新增并带溯源。落盘后必须在回复末尾用 **3~5 行清晰回执**列出改了哪格、加了哪条、commit 号，并注明“不满意说撤回记忆即可秒退”。`,
+			`   - **高风险改动（必须先给草稿确认，严禁直接写入）**：若涉及修改/删除 \`PROFILE.md\` 个人名片或带 \`[pin]\` 锁钉的条目，先运行 \`clue view\` 核对原文并贴出前后对比草稿，等用户明确点头后再用 \`clue curate\` 落盘。`,
+			`   - **若无实质新知**：只需简短告知「记忆检查：本次无新增记忆」，绝不硬凑。`,
 		);
-		step++;
-		if (health.hint) {
-			wrapLines.push(`${step}. 顺带在回复末尾向用户转达健康提醒：${health.hint}`);
-		}
 		notices.push(wrapLines.join("\n"));
 	} else if (intent.isCasualClose) {
 		const closeLines = [
-			"【clue 轻量收尾自检（草稿确认制）】",
-			"检测到用户正在结束本次问答/小任务。请在正常回应之后，顺手做一次极轻的记忆自检：",
-			"- 若本次没有任何值得跨会话长期记住的新偏好、纠偏或真坑：只在回复末尾用一句极短的话带过（例如：`记忆检查：本次无新增长期记忆。`），不要啰嗦。",
-			"- 若确实出现了值得长期记住的偏好或真坑：**不要直接写入！**用 2~5 行给出清晰的「建议记忆草稿」（写哪边、具体内容），问用户“这样记可以吗？”，等确认后再走 `clue curate` / `clue pitfall` 写入。",
+			"【clue 轻量收尾沉淀（固定槽位一轮落盘 + 透明回执）】",
+			"检测到用户正在结束本次对话。请在正常回应之后，顺手做一次轻量沉淀：",
+			"- 若本次没有新的项目设计/取舍/踩坑：只在回复末尾用一句极短的话带过（如 `记忆检查：本次无新增记忆。`），绝不啰嗦。",
+			"- 若有新进展、关键决定或真坑：**低风险项**（用 `clue intent` 局部刷新变动槽位，或 `clue pitfall` / `clue decision` 新增记录）可直接落盘并在末尾用 3~5 行清晰回执亮明改了哪格/加了哪条（附 commit 号，支持秒撤）；**高风险项**（修改/删除 `PROFILE.md` 核心名片或 `[pin]` 条目）必须先给对比草稿等用户点头，绝不擅自改写。",
 		];
-		if (health.hint) {
-			closeLines.push(`- 附带提醒：${health.hint}`);
-		}
 		notices.push(closeLines.join("\n"));
 	} else if (intent.isExplicitMemoryEdit) {
 		notices.push(
 			[
 				"【clue 显式记忆维护】",
 				"检测到用户明确要求记录、修改、删除或回滚记忆：",
-				"- 修改前先运行 `clue view`（或 `clue search`）核对原文；",
-				"- 通过 `clue curate` / `clue pitfall`（stdin JSON）完成变更，严禁直接编辑记忆文件；",
-				"- 若用户意图明确且具体，可直接落盘并简短汇报变更内容与最新水位；若措辞宽泛，先给草稿确认。",
-				"- 如用户要求回滚上一次变更，运行 `clue undo`。",
+				"- 更新项目 4 格意图卡用 `clue intent`（stdin JSON，仅传需变动的槽位）；",
+				"- 记录/演进关键决定用 `clue decision`，踩坑用 `clue pitfall`；",
+				"- 修改/删除 `PROFILE.md` 或 `PROJECTS.md` 前先运行 `clue view` 核对原文，并通过 `clue curate`（必须提供完整 `expectedEntry`）落盘，严禁直接编辑文件；",
+				"- 如用户要求撤回上一次变更，直接运行 `clue undo`。",
 			].join("\n"),
 		);
 	}

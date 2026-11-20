@@ -10,7 +10,7 @@ const CONTINUATION_CUES =
 	/(?:帮我|请|继续|接下来|再|然后|顺便|还有|另外|改一下|修一下|查一下|看看|写一个|加一个|怎么|为什么|能不能|要不要|是否|吗[？?]?$|\?|？)/;
 
 const CASUAL_CLOSE_RE =
-	/(?:没事了|没别的事了|先这样|就这样吧?|好了先这样|可以了|行了先这样|搞定了?谢谢|谢谢没事了|今天就到这|先到这吧?|结束吧?|没问题了谢谢|行，?先这样|好，?没事了|that'?s all(?: for now)?|all good(?:,? thanks)?|nothing else)/i;
+	/(?:(?:ok|好的?|行了?|可以了?)[，,\s]*没事了|没事了|没别的事了|先这样|就这样吧?|好了先这样|可以了|行了先这样|搞定了?谢谢|谢谢没事了|今天就到这|先到这吧?|结束吧?|没问题了谢谢|行，?先这样|好，?没事了|that'?s all(?: for now)?|all good(?:,? thanks)?|nothing else)/i;
 
 // Questions or meta-discussions talking ABOUT hooks/rituals/memory rather than issuing a command
 const QUESTION_OR_META_RE =

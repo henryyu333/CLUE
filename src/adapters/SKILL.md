@@ -1,61 +1,78 @@
 ---
 name: clue
 description: >-
-  Personal memory and anti-anchoring pitfall lookup via the `clue` CLI.
-  Use when searching past technical pitfalls (`clue search`), reviewing or
-  updating personal preferences/project conventions (`clue view` / `clue curate` /
-  `clue pitfall`) after user approval, or running a memory health audit (`clue dream`).
+  Personal memory, 4-slot project intent cards, anti-anchoring pitfalls & decisions,
+  and cross-harness session recall via the `clue` CLI. Use when searching past bugs
+  or decisions (`clue search`), recalling verbatim cross-tool chats (`clue recall` /
+  `clue show`), updating project intent/pitfalls/decisions on wrap-up (`clue intent` /
+  `clue pitfall` / `clue decision`), curating core background (`clue curate`) after
+  user approval, or running a memory health audit (`clue dream`).
 ---
 
 # clue Personal Memory Workflow
 
-`clue` manages the user's single-source personal memory (`PROFILE.md`, `PROJECTS.md`, `pitfalls.db`).
-Never directly edit files inside the memory directory with raw file-edit tools — always go through `clue` so hard character caps, secret scanning, locking, and automatic Git commits stay intact.
+`clue` manages the user's single-source personal memory (`PROFILE.md`, `INTENTS.json`, `PROJECTS.md`, `pitfalls.db`).
+Never directly edit files inside the memory directory with raw file-edit tools — core files are OS read-only guarded and must go through `clue` so validation, locking, and automatic Git commits stay intact.
 
 ## Core Principles
 
 1. **Silent read-only by default**: Do not modify memory unprompted during ordinary work.
-2. **Draft-first approval**: On wrap-up or closing turns, check whether anything is truly worth remembering across sessions.
-   - If nothing new emerged, state briefly that there is no new long-term memory.
-   - If something should be saved, present a concise draft (target, add/patch/remove or pitfall fields) and wait for the user's confirmation before executing `clue curate` or `clue pitfall`.
-3. **Anti-anchoring on pitfalls**: Trust `root_cause` as a verified clue, treat `historical_fix` as reference only, and check `evidence` if details may have changed. If you validate a cleaner fix, propose `op: "supersede"`.
+2. **Tiered wrap-up persistence (low-risk direct + receipt; high-risk draft-first)**:
+   - **Low-risk daily updates** (`clue intent` partial slot updates, adding a new `clue pitfall` or `clue decision` with `evidence`): on natural close/wrap-up, write directly through `clue` and append a crisp **3–5 line receipt** at the end of your reply showing exact slot diffs/new entries, commit hash, and that saying "undo memory" (`clue undo`) reverts immediately.
+   - **High-risk updates** (editing/deleting `PROFILE.md` background/taste card or `[pin]` entries): **never write directly** — run `clue view` first, show a clear before/after diff draft, and wait for user approval before calling `clue curate` (with mandatory `expectedEntry`).
+   - If nothing worth remembering happened, add one brief line (or omit noise).
+3. **Anti-anchoring on pitfalls & decisions**: Trust `root_cause` / `rationale` as verified clues, treat `historical_fix` as reference only, and check `revisit_when` + `evidence`. If a cleaner fix or changed assumption emerges, use `op: "supersede"`.
 
 ## Commands
 
-### 1. Search historical pitfalls & past raw sessions (read-only)
+### 1. Search pitfalls, decisions & past raw sessions (read-only)
 ```bash
-clue search "<keywords or error>" [--project <name>] [--limit 4]
+clue search "<keywords>" [--type all|pitfall|decision] [--project <name>] [--limit 4]
 clue recall "<keywords>" [--harness agy|claude|codex|omp|pi|opencode|hermes] [--since 30d] [--limit 6]
 clue show <session-id-prefix> --around <seq> [--window 4]
 ```
-- Use `clue search` first for verified anti-anchoring bug root causes.
-- Use `clue recall` + `clue show --around` when you need exact verbatim details from past sessions across any harness (zero memory tax; if keywords miss, retry with synonyms using `OR`).
 
-### 2. Inspect current memory & capacity before proposing edits
+### 2. Inspect current memory, status & web export
 ```bash
 clue view
 clue status
+clue intent
+clue export [--project <name>]
 ```
 
-### 3. Curate hot-layer memory (stdin JSON, after user approval)
+### 3. Update 4-slot project intent card (partial slot update via stdin JSON)
 ```bash
-clue curate <<'EOF'
+clue intent <<'EOF'
 {
-  "target": "profile",
-  "scope": "认知与审美偏好",
-  "operations": [
-    { "action": "add", "content": "Concise single-line entry <= 160 chars." }
-  ],
-  "reason": "short summary of why this changed"
+  "project": "myrepo",
+  "goal": "Optional: only pass slots that actually changed",
+  "approach": "Optional",
+  "nonGoals": "Optional",
+  "checkpoint": "Where this session stopped and next step",
+  "evidence": "agy:conv-id or commit hash"
 }
 EOF
 ```
-- `target`: `"profile"` (`技术底座` | `认知与审美偏好` | `个人与协作习惯`) or `"projects"` (`global` or lowercase project key).
-- `operations` supports `"add"`, `"patch"` (`oldText`, optional `expectedEntry`, `content`), `"remove"` (`oldText`, optional `expectedEntry`).
-- If a hard-cap error occurs, combine `remove`/`patch` + `add` in the same atomic `operations` array.
-- Add `--dry-run` to preview capacity before committing.
+- Untouched slots are preserved verbatim. Total card budget is strictly bounded (`<= 450` chars).
 
-### 4. Log or supersede a pitfall (stdin JSON, after user approval)
+### 4. Log or supersede a key decision (stdin JSON)
+```bash
+clue decision <<'EOF'
+{
+  "op": "add",
+  "project": "myrepo",
+  "topic": "architecture",
+  "decision": "Chosen approach",
+  "rationale": "Why chosen & what was rejected",
+  "assumptions": "Underlying premise",
+  "revisitWhen": "Condition under which this should be reconsidered",
+  "evidence": "Session ID, file path, or commit hash"
+}
+EOF
+```
+- `op`: `"add"` | `"supersede"` (requires `id`) | `"update"` (requires `id`) | `"revert"` (requires `id`) | `"delete"` (requires `id`).
+
+### 5. Log or supersede a pitfall (stdin JSON)
 ```bash
 clue pitfall <<'EOF'
 {
@@ -63,18 +80,34 @@ clue pitfall <<'EOF'
   "project": "global",
   "tags": "tag1, tag2",
   "symptom": "Observable failure or trigger",
-  "rootCause": "Objective underlying mechanism (no imperative workaround rules)",
+  "rootCause": "Objective underlying mechanism",
   "historicalFix": "How it was resolved at the time",
   "rethinkHint": "When/how a cleaner solution would replace this",
-  "evidence": "Optional file path, commit hash, or session anchor"
+  "evidence": "File path, commit hash, or session anchor"
 }
 EOF
 ```
-- `op`: `"add"` | `"supersede"` (requires `id`) | `"update"` (requires `id`) | `"delete"` (requires `id`).
 
-### 5. Deep health audit ("dreaming") and rollback
+### 6. Curate core background card (stdin JSON, after user approval)
 ```bash
-clue dream                  # Print health metrics, duplicates, active pitfalls & recent commits
-clue dream --mark-done      # Mark audit complete after approved updates land
+clue curate <<'EOF'
+{
+  "target": "profile",
+  "scope": "技术底座",
+  "operations": [
+    { "action": "patch", "oldText": "unique substring", "expectedEntry": "exact full original line", "content": "updated single-line entry" }
+  ],
+  "reason": "short summary of why this changed"
+}
+EOF
+```
+- `patch` and `remove` require exact `expectedEntry`. Entries tagged with `[pin]` require explicit `"forcePin": true` after user confirmation.
+
+### 7. Health audit, adapter check, lock & rollback
+```bash
+clue dream                  # Staleness evidence check, 0-hit cold items, duplicates & active ledger
+clue dream --mark-done      # Mark audit complete
+clue doctor --adapters      # Verify all 7 harnesses' hook/guard/skill wiring
 clue undo                   # Safely revert the latest memory commit
+clue unlock / clue lock     # Temporarily unlock/relock read-only memory files for manual edits
 ```

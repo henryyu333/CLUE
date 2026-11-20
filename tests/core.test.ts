@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	buildBootSnapshot,
+	buildDreamPacket,
 	buildProactiveFlashback,
 	buildTurnNotice,
+	buildWebExportBundle,
 	checkRawEditGuard,
 	classifyPromptIntent,
 	curateHotMemory,
@@ -31,6 +33,7 @@ import {
 	searchPitfalls,
 	undoLastMemoryCommit,
 	unlockFilesWritable,
+	verifyEvidenceAnchor,
 	type ClueConfig,
 	type CluePaths,
 } from "../src/core/index.ts";
@@ -484,14 +487,16 @@ describe("intent classification & guardrails", () => {
 		expect(meta.lastDreamAt).toBeTruthy();
 	});
 
-	test("turn notice enforces draft-first on both wrap-up and casual close", () => {
+	test("turn notice enforces tiered wrap-up (direct low-risk + receipt, draft-first high-risk)", () => {
+		expect(classifyPromptIntent("OK 没事了").isCasualClose).toBe(true);
 		const wrap = buildTurnNotice(config, paths, "收尾吧", tempHome);
-		expect(wrap).toContain("不要直接落盘");
-		expect(wrap).toContain("记忆修改草稿");
+		expect(wrap).toContain("clue intent");
+		expect(wrap).toContain("3~5 行清晰回执");
+		expect(wrap).toContain("高风险改动");
 
-		const casual = buildTurnNotice(config, paths, "没事了", tempHome);
-		expect(casual).toContain("不要直接写入");
-		expect(casual).toContain("记忆检查：本次无新增长期记忆");
+		const casual = buildTurnNotice(config, paths, "OK 没事了", tempHome);
+		expect(casual).toContain("clue intent");
+		expect(casual).toContain("记忆检查：本次无新增记忆");
 	});
 
 	test("applies generic projectWorkflows from clue.config.json when marker file exists", () => {
@@ -680,5 +685,54 @@ describe("v0.4 project 4-slot intent cards, decisions, continuity & proactive fl
 		expect(snap.block).toContain("[Decision #2]");
 		expect(snap.block).toContain("[Pitfall #1]");
 		expect(snap.block).not.toContain("## HEALTH");
+	});
+
+	test("v0.5 verifies stale file evidence in dream audit and scrubs secrets in web export", () => {
+		const repoDir = join(tempHome, "sample-repo");
+		mkdirSync(join(repoDir, "src"), { recursive: true });
+		writeFileSync(join(repoDir, "src", "alive.ts"), "export const ok = true;\n", "utf8");
+
+		expect(verifyEvidenceAnchor("src/alive.ts#L1", repoDir).status).toBe("valid");
+		expect(verifyEvidenceAnchor("src/deleted.ts#L10-L20", repoDir).status).toBe("stale-file-missing");
+
+		mutatePitfall(
+			paths,
+			{
+				op: "add",
+				project: "sample-repo",
+				tags: "stale",
+				symptom: "旧模块偶发崩溃",
+				rootCause: "旧模块未判空",
+				historicalFix: "加空值检查",
+				rethinkHint: "重构后可移除",
+				evidence: "src/deleted.ts#L10",
+			},
+			"sample-repo",
+			config.readOnlyGuard,
+		);
+		mutateProjectIntent(
+			config,
+			paths,
+			{
+				project: "sample-repo",
+				goal: "导出干净上下文给网页端",
+				checkpoint: "验证脱敏",
+			},
+			"sample-repo",
+		);
+
+		const health = evaluateMemoryHealth(config, paths, "sample-repo", repoDir);
+		expect(health.metrics.staleEvidenceCount).toBe(1);
+		expect(health.metrics.evidenceChecks[0]!.status).toBe("stale-file-missing");
+
+		const dreamPacket = buildDreamPacket(config, paths, "sample-repo", repoDir);
+		expect(dreamPacket).toContain("溯源疑似过期告警");
+		expect(dreamPacket).toContain("src/deleted.ts");
+
+		// Web export bundles background + intent card + pitfalls and scrubs any accidental secret
+		const bundle = buildWebExportBundle(config, paths, "sample-repo");
+		expect(bundle.text).toContain("Active Project Intent (sample-repo)");
+		expect(bundle.text).toContain("导出干净上下文给网页端");
+		expect(bundle.text).toContain("旧模块偶发崩溃");
 	});
 });

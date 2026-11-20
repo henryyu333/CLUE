@@ -8,6 +8,7 @@ import {
 	buildDreamPacket,
 	buildProactiveFlashback,
 	buildTurnNotice,
+	buildWebExportBundle,
 	checkRawEditGuard,
 	curateHotMemory,
 	detectUnauthorizedChanges,
@@ -52,7 +53,7 @@ import {
 } from "./recall/index.ts";
 import { inspectHarnessAdapters, installHarnessAdapter, type InstallTarget } from "./adapters/install.ts";
 
-const VERSION = "0.4";
+const VERSION = "0.5";
 
 function parseArgs(argv: string[]): { positionals: string[]; flags: Record<string, string | boolean> } {
 	const positionals: string[] = [];
@@ -181,6 +182,7 @@ Usage:
   clue curate [--dry-run] [--cwd <dir>]          (reads JSON payload from stdin)
   clue pitfall [--cwd <dir>]                     (reads JSON payload from stdin)
   clue dream [--cwd <dir>] [--mark-done] [--summary <text>] [--json]
+  clue export [--project <key>] [--json]
   clue log [--limit <n>]
   clue undo
   clue lock / unlock
@@ -718,9 +720,19 @@ async function main(): Promise<void> {
 			return;
 		}
 		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify(evaluateMemoryHealth(config, paths, projectKey), null, 2));
+			console.log(JSON.stringify(evaluateMemoryHealth(config, paths, projectKey, cwd), null, 2));
 		} else {
-			console.log(buildDreamPacket(config, paths, projectKey));
+			console.log(buildDreamPacket(config, paths, projectKey, cwd));
+		}
+		return;
+	}
+
+	if (cmd === "export") {
+		const bundle = buildWebExportBundle(config, paths, projectKey);
+		if (getFlagBool(flags, "json")) {
+			console.log(JSON.stringify(bundle, null, 2));
+		} else {
+			console.log(bundle.text);
 		}
 		return;
 	}
