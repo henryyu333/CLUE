@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,14 +9,17 @@ import {
 	buildTurnNotice,
 	checkRawEditGuard,
 	curateHotMemory,
+	detectUnauthorizedChanges,
 	ensureClueStorage,
 	evaluateMemoryHealth,
 	formatAgyPreInvocation,
 	formatAgySessionStart,
 	formatClaudeHookOutput,
 	formatPitfallGuidance,
+	getReadOnlyGuardedFiles,
 	getRecentMemoryCommits,
 	loadClueConfig,
+	lockFilesReadOnly,
 	markDreamDone,
 	mutatePitfall,
 	openPitfallDb,
@@ -24,6 +27,7 @@ import {
 	resolveProjectKey,
 	searchPitfalls,
 	undoLastMemoryCommit,
+	unlockFilesWritable,
 	type CurateRequest,
 	type PitfallMutationRequest,
 } from "./core/index.ts";
@@ -34,9 +38,9 @@ import {
 	showSessionWindow,
 	type RecallHarness,
 } from "./recall/index.ts";
-import { installHarnessAdapter, type InstallTarget } from "./adapters/install.ts";
+import { inspectHarnessAdapters, installHarnessAdapter, type InstallTarget } from "./adapters/install.ts";
 
-const VERSION = "0.2";
+const VERSION = "0.3";
 
 function parseArgs(argv: string[]): { positionals: string[]; flags: Record<string, string | boolean> } {
 	const positionals: string[] = [];
@@ -82,10 +86,35 @@ function getFlagBool(flags: Record<string, string | boolean>, key: string): bool
 	return flags[key] === true || flags[key] === "true";
 }
 
+const DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
+
+function cleanupStaleDedupFiles(dir: string): void {
+	try {
+		const now = Date.now();
+		for (const name of readdirSync(dir)) {
+			if (!name.endsWith(".json")) continue;
+			const full = join(dir, name);
+			try {
+				const st = statSync(full);
+				if (now - st.mtimeMs > DEDUP_TTL_MS) {
+					rmSync(full, { force: true });
+				}
+			} catch {
+				// ignore individual file errors
+			}
+		}
+	} catch {
+		// ignore
+	}
+}
+
 function wasHookTurnSeen(scopeKey: string, turnFingerprint: string): boolean {
 	try {
 		const dir = join(tmpdir(), "clue-hook-dedup");
 		mkdirSync(dir, { recursive: true });
+		if (Math.random() < 0.05) {
+			cleanupStaleDedupFiles(dir);
+		}
 		const file = join(dir, `${createHash("sha1").update(scopeKey).digest("hex").slice(0, 16)}.json`);
 		if (existsSync(file)) {
 			const prev = JSON.parse(readFileSync(file, "utf8")) as { fp?: string };
@@ -115,7 +144,8 @@ Usage:
   clue dream [--cwd <dir>] [--mark-done] [--summary <text>] [--json]
   clue log [--limit <n>]
   clue undo
-  clue doctor [--json]
+  clue lock / unlock
+  clue doctor [--adapters] [--json]
   clue install <agy|claude|codex|hermes> [--bin <path>] [--dry-run]
   clue hook <session-start|prompt|guard> --harness <agy|claude|codex|hermes> [--with-boot]
   clue version
@@ -285,7 +315,7 @@ async function main(): Promise<void> {
 	const config = loadClueConfig(getFlagStr(flags, "home"));
 	const paths = ensureClueStorage(config);
 	const cwd = getFlagStr(flags, "cwd") ?? process.cwd();
-	const projectKey = getFlagStr(flags, "project")?.trim().toLowerCase() || resolveProjectKey(cwd);
+	const projectKey = getFlagStr(flags, "project")?.trim().toLowerCase() || resolveProjectKey(cwd, config.workspaceRoots);
 
 	if (cmd === "boot") {
 		const snap = buildBootSnapshot(config, paths, cwd);
@@ -315,16 +345,20 @@ async function main(): Promise<void> {
 	if (cmd === "status") {
 		const view = readHotMemoryView(config, paths, projectKey);
 		const health = evaluateMemoryHealth(config, paths, projectKey);
+		const tampering = detectUnauthorizedChanges(paths.home);
 		const pitfalls = searchPitfalls(paths.dbPath, positionals.slice(1).join(" "), projectKey, 5, false);
 		const commits = getRecentMemoryCommits(paths.home, 4);
 		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify({ home: paths.home, projectKey, health, recentPitfalls: pitfalls, commits }, null, 2));
+			console.log(JSON.stringify({ home: paths.home, projectKey, health, tampering, recentPitfalls: pitfalls, commits }, null, 2));
 			return;
 		}
 		const m = health.metrics;
 		const projPct = Math.round((view.scoped.projectChars / config.limits.singleProjectChars) * 100);
 		const lines = [
 			`📚 clue 个人记忆状态（数据目录：${paths.home}）`,
+			...(tampering.dirty
+				? [`⚠️ 完整性警报：检测到绕过 clue 的未提交修改（${tampering.files.join(", ")}），请核对 git diff！`]
+				: []),
 			`- PROFILE.md：${m.profileChars} / ${m.profileLimit} 字 (${m.profilePct}%)`,
 			`- PROJECTS.md：全局 ${m.globalChars} / ${m.globalLimit} 字 (${m.globalPct}%) | 当前项目 (${projectKey ?? "无"}) ${view.scoped.projectChars} / ${config.limits.singleProjectChars} 字 (${projPct}%)`,
 			`- 活跃踩坑：${m.activePitfalls} 条（缺少溯源 ${m.pitfallsWithoutEvidence} 条）`,
@@ -357,7 +391,13 @@ async function main(): Promise<void> {
 	if (cmd === "index") {
 		const harnessFlag = getFlagStr(flags, "harness")?.toLowerCase() as RecallHarness | undefined;
 		const rebuild = getFlagBool(flags, "rebuild");
-		const summary = indexRecallSessions(paths.recallDbPath, { harness: harnessFlag, rebuild });
+		const summary = indexRecallSessions(paths.recallDbPath, {
+			harness: harnessFlag,
+			rebuild,
+			lockPath: paths.recallLockPath,
+			worktreeSuffixes: config.worktreeSuffixes,
+			workspaceRoots: config.workspaceRoots,
+		});
 		if (getFlagBool(flags, "json")) {
 			console.log(JSON.stringify(summary, null, 2));
 			return;
@@ -393,7 +433,12 @@ async function main(): Promise<void> {
 	if (cmd === "recall") {
 		const harnessFlag = getFlagStr(flags, "harness")?.toLowerCase() as RecallHarness | undefined;
 		if (!getFlagBool(flags, "no-refresh")) {
-			indexRecallSessions(paths.recallDbPath, { harness: harnessFlag });
+			indexRecallSessions(paths.recallDbPath, {
+				harness: harnessFlag,
+				lockPath: paths.recallLockPath,
+				worktreeSuffixes: config.worktreeSuffixes,
+				workspaceRoots: config.workspaceRoots,
+			});
 		}
 		const query = positionals.slice(1).join(" ").trim();
 		const limRaw = Number.parseInt(getFlagStr(flags, "limit") ?? "8", 10);
@@ -496,7 +541,7 @@ async function main(): Promise<void> {
 			console.error(`stdin JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
 			process.exit(1);
 		}
-		const res = mutatePitfall(paths, req, projectKey);
+		const res = mutatePitfall(paths, req, projectKey, config.readOnlyGuard);
 		if (!res.ok) {
 			console.error(res.message);
 			process.exit(1);
@@ -527,12 +572,27 @@ async function main(): Promise<void> {
 	}
 
 	if (cmd === "undo") {
-		const res = undoLastMemoryCommit(paths.home);
+		const res = undoLastMemoryCommit(paths.home, {
+			guardedFiles: getReadOnlyGuardedFiles(paths),
+			restoreReadOnly: config.readOnlyGuard,
+		});
 		if (!res.ok) {
 			console.error(res.message);
 			process.exit(1);
 		}
 		console.log(res.message);
+		return;
+	}
+
+	if (cmd === "unlock") {
+		const unlocked = unlockFilesWritable(getReadOnlyGuardedFiles(paths));
+		console.log(`🔓 已临时解锁 ${unlocked.length} 个核心记忆文件为可写状态（手动编辑完后可运行 \`clue lock\` 重新加锁）。`);
+		return;
+	}
+
+	if (cmd === "lock") {
+		const locked = lockFilesReadOnly(getReadOnlyGuardedFiles(paths));
+		console.log(`🔒 已锁定 ${locked.length} 个核心记忆文件为只读（0444），防止任意 Harness 绕过校验直接篡改。`);
 		return;
 	}
 
@@ -542,6 +602,12 @@ async function main(): Promise<void> {
 		checks.push({ name: "PROFILE.md", ok: existsSync(paths.profilePath), detail: paths.profilePath });
 		checks.push({ name: "PROJECTS.md", ok: existsSync(paths.projectsPath), detail: paths.projectsPath });
 		checks.push({ name: "Git repo", ok: existsSync(join(paths.home, ".git")), detail: join(paths.home, ".git") });
+		const tampering = detectUnauthorizedChanges(paths.home);
+		checks.push({
+			name: "Git integrity sentinel",
+			ok: !tampering.dirty,
+			detail: tampering.dirty ? `uncommitted edits: ${tampering.files.join(", ")}` : "clean",
+		});
 		try {
 			const db = openPitfallDb(paths.dbPath);
 			const cnt = (db.query("SELECT COUNT(*) as c FROM pitfalls").get() as { c: number }).c;
@@ -551,11 +617,20 @@ async function main(): Promise<void> {
 			checks.push({ name: "SQLite FTS5 pitfalls.db", ok: false, detail: String(e) });
 		}
 
+		const adapters = getFlagBool(flags, "adapters") ? inspectHarnessAdapters() : undefined;
+
 		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify({ ok: checks.every(c => c.ok), checks }, null, 2));
+			console.log(JSON.stringify({ ok: checks.every(c => c.ok), checks, ...(adapters ? { adapters } : {}) }, null, 2));
 		} else {
 			for (const c of checks) {
 				console.log(`${c.ok ? "✅" : "❌"} ${c.name}: ${c.detail}`);
+			}
+			if (adapters) {
+				console.log("\n🔌 Harness 接入状态（7 大工具巡检）：");
+				for (const a of adapters) {
+					const icon = !a.detected ? "⚪" : a.hookWired ? "✅" : "⚠️";
+					console.log(`  ${icon} ${a.harness.padEnd(9)} ${a.detail}`);
+				}
 			}
 		}
 		if (!checks.every(c => c.ok)) process.exit(1);

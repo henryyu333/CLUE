@@ -49,6 +49,7 @@ export function openPitfallDb(dbPath: string): Database {
 	const db = new Database(dbPath);
 	db.exec(`
 		PRAGMA journal_mode = WAL;
+		PRAGMA busy_timeout = 5000;
 		CREATE TABLE IF NOT EXISTS pitfalls (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			project TEXT NOT NULL DEFAULT 'global',
@@ -111,10 +112,10 @@ export function openPitfallDb(dbPath: string): Database {
 	return db;
 }
 
-export function exportPitfallsJsonl(db: Database, jsonlPath: string): void {
+export function exportPitfallsJsonl(db: Database, jsonlPath: string, readOnly = true): void {
 	const rows = db.query("SELECT * FROM pitfalls ORDER BY id ASC").all() as PitfallRow[];
 	const content = rows.length > 0 ? `${rows.map(r => JSON.stringify(r)).join("\n")}\n` : "";
-	atomicWriteFileSync(jsonlPath, content);
+	atomicWriteFileSync(jsonlPath, content, { readOnly });
 }
 
 export function listActivePitfalls(dbPath: string): PitfallRow[] {
@@ -260,6 +261,7 @@ export function mutatePitfall(
 	paths: CluePaths,
 	params: PitfallMutationRequest,
 	defaultProject: string | null,
+	readOnlyGuard = true,
 ): PitfallMutationResult {
 	for (const field of [params.tags, params.symptom, params.rootCause, params.historicalFix, params.rethinkHint, params.evidence]) {
 		if (!field) continue;
@@ -278,7 +280,7 @@ export function mutatePitfall(
 			if (params.op === "delete") {
 				if (!params.id) return { ok: false, message: "delete 操作需要提供 id。" };
 				const res = db.query("DELETE FROM pitfalls WHERE id = ?").run(params.id);
-				exportPitfallsJsonl(db, paths.jsonlPath);
+				exportPitfallsJsonl(db, paths.jsonlPath, readOnlyGuard);
 				const sha = commitMemoryGit(paths.home, `pitfall: delete #${params.id}`);
 				return {
 					ok: true,
@@ -310,7 +312,7 @@ export function mutatePitfall(
 					now,
 					params.id,
 				);
-				exportPitfallsJsonl(db, paths.jsonlPath);
+				exportPitfallsJsonl(db, paths.jsonlPath, readOnlyGuard);
 				const sha = commitMemoryGit(paths.home, `pitfall: update #${params.id}`);
 				return {
 					ok: true,
@@ -357,7 +359,7 @@ export function mutatePitfall(
 				);
 			}
 
-			exportPitfallsJsonl(db, paths.jsonlPath);
+			exportPitfallsJsonl(db, paths.jsonlPath, readOnlyGuard);
 			const sha = commitMemoryGit(
 				paths.home,
 				params.op === "supersede" ? `pitfall: #${newId} supersedes #${params.id}` : `pitfall: add #${newId} (${proj})`,

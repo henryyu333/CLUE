@@ -2,16 +2,20 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { DEFAULT_WORKSPACE_ROOTS } from "./config.ts";
 
 /**
  * Resolve a stable lowercase project key from cwd.
- * Collapses git worktrees (e.g. Foo-fix, Foo-rvcore) back to the primary repo name.
+ * Collapses git worktrees (e.g. Foo-fix, Foo-wt1) back to the primary repo name.
  */
-export function resolveProjectKey(cwd: string): string | null {
+export function resolveProjectKey(cwd: string, workspaceRoots: readonly string[] = DEFAULT_WORKSPACE_ROOTS): string | null {
 	const home = resolve(homedir());
-	const workspaceRoot = join(home, "workspace");
 	const resolvedCwd = resolve(cwd);
-	if (resolvedCwd === home || resolvedCwd === workspaceRoot) return null;
+	const rootNames = new Set(workspaceRoots.map(r => r.toLowerCase()));
+	if (resolvedCwd === home) return null;
+	for (const r of rootNames) {
+		if (resolvedCwd === join(home, r)) return null;
+	}
 
 	try {
 		const commonDir = execFileSync("git", ["-C", resolvedCwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
@@ -21,14 +25,14 @@ export function resolveProjectKey(cwd: string): string | null {
 		if (commonDir) {
 			const primaryRoot = basename(commonDir) === ".git" ? dirname(commonDir) : dirname(dirname(commonDir));
 			const name = basename(primaryRoot).trim().toLowerCase();
-			if (name && name !== "workspace") return name;
+			if (name && !rootNames.has(name)) return name;
 		}
 	} catch {
 		// Fall back to directory name normalization outside git
 	}
 
 	const rawBase = basename(resolvedCwd).trim().toLowerCase();
-	if (!rawBase) return null;
+	if (!rawBase || rootNames.has(rawBase)) return null;
 	const dashIdx = rawBase.indexOf("-");
 	if (dashIdx > 0) {
 		const prefix = rawBase.slice(0, dashIdx);

@@ -10,8 +10,10 @@ export interface CurateOperation {
 	action: "add" | "patch" | "remove";
 	section?: string;
 	oldText?: string;
-	/** Optional full-line pin (inspired by Hermes): refuses mutation if the matched entry drifted since preview. */
+	/** Mandatory full-line pin for patch/remove: refuses mutation if the matched entry drifted since preview. */
 	expectedEntry?: string;
+	/** Explicit override required to patch or remove an entry tagged with [pin]. */
+	forcePin?: boolean;
 	content?: string;
 }
 
@@ -32,6 +34,10 @@ export interface CurateResult {
 
 export function charCount(text: string): number {
 	return [...text.trim()].length;
+}
+
+export function isPinnedEntry(entry: string): boolean {
+	return /^(?:\[pin\]\s*)|(?:\s*\[pin\])$/i.test(entry.trim());
 }
 
 export function parseSectionedMarkdown(raw: string): SectionMap {
@@ -177,7 +183,7 @@ export function curateHotMemory(
 		const projectsRaw = existsSync(paths.projectsPath) ? readFileSync(paths.projectsPath, "utf8") : "";
 		const isProfile = req.target === "profile";
 		const map = parseSectionedMarkdown(isProfile ? profileRaw : projectsRaw);
-		const appliedSummary: string[] = [];
+		const appliedDiff: string[] = [];
 
 		const resolveHeading = (opSection?: string): { ok: true; heading: string } | { ok: false; err: string } => {
 			const rawSec = (opSection ?? req.scope ?? "").trim();
@@ -211,12 +217,19 @@ export function curateHotMemory(
 				const items = map.get(resolved.heading)!;
 				if (!items.includes(clean)) {
 					items.push(clean);
-					appliedSummary.push(`➕ [${resolved.heading}] ${clean}`);
+					appliedDiff.push(`+ [${resolved.heading}] ${clean}`);
 				}
 			} else if (op.action === "patch" || op.action === "remove") {
 				const needle = (op.oldText ?? "").trim();
 				if (!needle) {
 					return { ok: false, message: `${op.action} 操作必须提供 oldText 子串以唯一定位目标条目。` };
+				}
+				const expectedClean = op.expectedEntry?.trim().replace(/^-\s+/, "") ?? "";
+				if (!expectedClean) {
+					return {
+						ok: false,
+						message: `行级锁拦截：${op.action} 操作必须提供完整的 expectedEntry 原文核对，防止看错行改错条目。请先运行 \`clue view\` 核对原文。`,
+					};
 				}
 				const matches: Array<{ heading: string; idx: number; item: string }> = [];
 				const targetFilter = op.section ? resolveHeading(op.section) : null;
@@ -242,22 +255,28 @@ export function curateHotMemory(
 					};
 				}
 				const hit = matches[0]!;
-				if (op.expectedEntry && hit.item !== op.expectedEntry.trim().replace(/^-\s+/, "")) {
+				if (hit.item !== expectedClean) {
 					return {
 						ok: false,
-						message: `行级锁拦截：目标条目在你预览草稿后已发生变化。\n期望原文：${op.expectedEntry}\n当前原文：${hit.item}\n请重新查看后再确认写入。`,
+						message: `行级锁拦截：目标条目在你预览草稿后已发生变化。\n期望原文：${expectedClean}\n当前原文：${hit.item}\n请重新查看后再确认写入。`,
+					};
+				}
+				if (isPinnedEntry(hit.item) && op.forcePin !== true) {
+					return {
+						ok: false,
+						message: `锁钉拦截：该条目带有 [pin] 保护标记，禁止常规 ${op.action} 操作。\n目标条目：${hit.item}\n如确需改动，请向用户确认后传入 forcePin: true。`,
 					};
 				}
 				const list = map.get(hit.heading)!;
 				if (op.action === "remove") {
 					list.splice(hit.idx, 1);
-					appliedSummary.push(`➖ [${hit.heading}] 淘汰: ${hit.item}`);
+					appliedDiff.push(`- [${hit.heading}] ${hit.item}`);
 				} else {
 					const err = validateEntryText(op.content ?? "", config.limits.entryChars);
 					if (err) return { ok: false, message: err };
 					const clean = (op.content ?? "").trim().replace(/^-\s+/, "");
 					list[hit.idx] = clean;
-					appliedSummary.push(`✏️ [${hit.heading}] 更新为: ${clean}`);
+					appliedDiff.push(`- [${hit.heading}] ${hit.item}`, `+ [${hit.heading}] ${clean}`);
 				}
 			} else {
 				return { ok: false, message: `不支持的操作类型：${String((op as { action?: unknown }).action)}` };
@@ -265,8 +284,11 @@ export function curateHotMemory(
 		}
 
 		if (isProfile) {
+			const prevChars = charCount(profileRaw);
 			const nextText = serializeProfile(map, config.profileSections);
 			const nextChars = charCount(nextText);
+			const delta = nextChars - prevChars;
+			const deltaStr = delta >= 0 ? `+${delta}` : `${delta}`;
 			if (nextChars > config.limits.profileChars) {
 				const overflow = nextChars - config.limits.profileChars;
 				return {
@@ -282,19 +304,19 @@ export function curateHotMemory(
 			if (req.dryRun) {
 				return {
 					ok: true,
-					message: `[DRY-RUN] PROFILE.md 预检通过 [${nextChars}/${config.limits.profileChars} 字 (${pct}%)]\n${appliedSummary.join("\n") || "无实质条目变动"}`,
-					details: { dryRun: true, chars: nextChars, limit: config.limits.profileChars },
+					message: `[DRY-RUN] PROFILE.md 预检通过 [${nextChars}/${config.limits.profileChars} 字 (${pct}%), 净变动 ${deltaStr} 字]\n${appliedDiff.join("\n") || "无实质条目变动"}`,
+					details: { dryRun: true, chars: nextChars, delta, limit: config.limits.profileChars },
 				};
 			}
-			atomicWriteFileSync(paths.profilePath, nextText);
+			atomicWriteFileSync(paths.profilePath, nextText, { readOnly: config.readOnlyGuard });
 			const sha = commitMemoryGit(paths.home, `profile: ${req.reason?.trim() || "curate entries"}`);
 			return {
 				ok: true,
 				commit: sha,
 				message:
-					`PROFILE.md 已更新 [${nextChars}/${config.limits.profileChars} 字 (${pct}%)]${sha ? ` (commit ${sha})` : ""}\n` +
-					(appliedSummary.join("\n") || "无实质条目变动"),
-				details: { chars: nextChars, limit: config.limits.profileChars, commit: sha },
+					`PROFILE.md 已更新 [${nextChars}/${config.limits.profileChars} 字 (${pct}%), 净变动 ${deltaStr} 字]${sha ? ` (commit ${sha})` : ""}\n` +
+					(appliedDiff.join("\n") || "无实质条目变动"),
+				details: { chars: nextChars, delta, limit: config.limits.profileChars, commit: sha },
 			};
 		}
 
@@ -324,18 +346,18 @@ export function curateHotMemory(
 				ok: true,
 				message:
 					`[DRY-RUN] PROJECTS.md 预检通过 [全局 ${scopedAfter.globalChars}/${config.limits.globalProjectChars} 字 | 当前项目 ${scopedAfter.projectChars}/${config.limits.singleProjectChars} 字]\n` +
-					(appliedSummary.join("\n") || "无实质条目变动"),
+					(appliedDiff.join("\n") || "无实质条目变动"),
 				details: { dryRun: true },
 			};
 		}
-		atomicWriteFileSync(paths.projectsPath, nextProjects);
+		atomicWriteFileSync(paths.projectsPath, nextProjects, { readOnly: config.readOnlyGuard });
 		const sha = commitMemoryGit(paths.home, `projects: ${req.reason?.trim() || "curate entries"}`);
 		return {
 			ok: true,
 			commit: sha,
 			message:
 				`PROJECTS.md 已更新 [全局 ${scopedAfter.globalChars}/${config.limits.globalProjectChars} 字 | 当前项目 ${scopedAfter.projectChars}/${config.limits.singleProjectChars} 字]${sha ? ` (commit ${sha})` : ""}\n` +
-				(appliedSummary.join("\n") || "无实质条目变动"),
+				(appliedDiff.join("\n") || "无实质条目变动"),
 			details: { commit: sha },
 		};
 	});

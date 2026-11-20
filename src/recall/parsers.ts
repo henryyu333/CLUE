@@ -2,6 +2,10 @@ import { Database } from "bun:sqlite";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { DEFAULT_WORKSPACE_ROOTS, DEFAULT_WORKTREE_SUFFIXES } from "../core/config.ts";
+import { redactSecrets } from "../core/security.ts";
+
+export { redactSecrets };
 
 export type RecallHarness = "agy" | "claude" | "codex" | "omp" | "pi" | "opencode" | "hermes";
 
@@ -19,6 +23,8 @@ export interface ParsedSession {
 	project: string;
 	cwd: string;
 	title: string;
+	firstUserMsg: string;
+	lastUserMsg: string;
 	sourcePath: string;
 	startedAt: string;
 	updatedAt: string;
@@ -37,24 +43,7 @@ export interface DiscoveredFile {
 }
 
 const MAX_STORED_MSG_CHARS = 8000;
-
-const REDACT_PATTERNS: readonly RegExp[] = [
-	/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
-	/\b(?:sk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{20,})\b/g,
-	/\b(?:ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|gho_[A-Za-z0-9]{30,})\b/g,
-	/\bAKIA[0-9A-Z]{16}\b/g,
-	/\bAIza[0-9A-Za-z_-]{35}\b/g,
-	/\bBearer\s+[A-Za-z0-9._-]{20,}\b/g,
-	/\beyJ[A-Za-z0-9_-]{12,}\.eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b/g,
-];
-
-export function redactSecrets(text: string): string {
-	let out = text;
-	for (const re of REDACT_PATTERNS) {
-		out = out.replace(re, "[REDACTED]");
-	}
-	return out;
-}
+const ANCHOR_MSG_CAP = 120;
 
 function cleanMessageText(raw: string): string {
 	let text = raw
@@ -81,22 +70,44 @@ function cleanMessageText(raw: string): string {
 	return text;
 }
 
-export function deriveProjectFromPath(cwdOrDir: string): string {
+function makeAnchorExcerpt(text: string): string {
+	const flat = text.replace(/\s+/g, " ").trim();
+	if (flat.length <= ANCHOR_MSG_CAP) return flat;
+	return `${flat.slice(0, ANCHOR_MSG_CAP)}…`;
+}
+
+function buildWorktreeSuffixRegex(suffixes: readonly string[]): RegExp {
+	const escaped = suffixes.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+	return new RegExp(`^([a-z0-9_]+)-(?:${escaped})[0-9]*$`);
+}
+
+export function deriveProjectFromPath(
+	cwdOrDir: string,
+	worktreeSuffixes: readonly string[] = DEFAULT_WORKTREE_SUFFIXES,
+	workspaceRoots: readonly string[] = DEFAULT_WORKSPACE_ROOTS,
+): string {
 	const raw = cwdOrDir.trim();
 	if (!raw) return "global";
-	// Handle Claude/OMP encoded folder names like -Users-alice-workspace-acme-fix
-	let seg = basename(raw.replace(/\/+$/, ""));
-	if (seg.startsWith("-") && seg.includes("workspace-")) {
-		seg = seg.split("workspace-").pop() ?? seg;
+	let seg = basename(raw.replace(/[/\\]+$/, ""));
+	const rootNames = new Set(workspaceRoots.map(r => r.toLowerCase()));
+	if (seg.startsWith("-")) {
+		for (const root of rootNames) {
+			const marker = `${root}-`;
+			if (seg.toLowerCase().includes(marker)) {
+				const idx = seg.toLowerCase().lastIndexOf(marker);
+				seg = seg.slice(idx + marker.length);
+				break;
+			}
+		}
 	} else if (seg.startsWith("--") && seg.endsWith("--")) {
 		seg = seg.slice(2, -2).split("-").pop() ?? seg;
 	}
 	const lower = seg.trim().toLowerCase();
-	if (!lower || lower === "workspace" || lower === basename(homedir()).toLowerCase()) {
+	if (!lower || rootNames.has(lower) || lower === basename(homedir()).toLowerCase()) {
 		return "global";
 	}
-	// Collapse common worktree suffixes like acme-fix / acme-wt1 -> acme
-	const m = lower.match(/^([a-z0-9_]+)-(?:fix|rv[a-z0-9]*|ship[0-9]*|windows|wt[0-9]*)$/);
+	const suffixRe = buildWorktreeSuffixRegex(worktreeSuffixes);
+	const m = lower.match(suffixRe);
 	return m ? m[1]! : lower;
 }
 
@@ -209,7 +220,10 @@ function readLinesFlexible(filePath: string): string[] {
 	return raw.split("\n");
 }
 
-export function parseFileSession(file: DiscoveredFile): ParsedSession | null {
+export function parseFileSession(
+	file: DiscoveredFile,
+	opts?: { worktreeSuffixes?: readonly string[]; workspaceRoots?: readonly string[] },
+): ParsedSession | null {
 	let lines: string[];
 	try {
 		lines = readLinesFlexible(file.path);
@@ -221,6 +235,8 @@ export function parseFileSession(file: DiscoveredFile): ParsedSession | null {
 	let sessionId = "";
 	let cwd = "";
 	let title = "";
+	let firstUserMsg = "";
+	let lastUserMsg = "";
 	let startedAt = "";
 	let updatedAt = "";
 	let isNoise = false;
@@ -230,15 +246,17 @@ export function parseFileSession(file: DiscoveredFile): ParsedSession | null {
 		if (!text) return;
 		if (!startedAt && ts) startedAt = ts;
 		if (ts) updatedAt = ts;
-		if (!title && role === "user") {
-			title = text.replace(/\s+/g, " ").slice(0, 90);
+		if (role === "user") {
+			const excerpt = makeAnchorExcerpt(text);
+			if (!firstUserMsg) firstUserMsg = excerpt;
+			lastUserMsg = excerpt;
+			if (!title) title = text.replace(/\s+/g, " ").slice(0, 90);
 		}
 		messages.push({ seq: messages.length + 1, role, ts: ts || "", content: text });
 	};
 
 	if (file.harness === "agy") {
-		// Path: ~/.gemini/antigravity/brain/<conv-id>/.system_generated/logs/transcript.jsonl
-		const parts = file.path.split("/");
+		const parts = file.path.split(/[/\\]+/);
 		const brainIdx = parts.lastIndexOf("brain");
 		sessionId = `agy:${brainIdx >= 0 && parts[brainIdx + 1] ? parts[brainIdx + 1] : basename(file.path)}`;
 		for (const line of lines) {
@@ -305,7 +323,6 @@ export function parseFileSession(file: DiscoveredFile): ParsedSession | null {
 	} else if (file.harness === "omp" || file.harness === "pi") {
 		const baseId = basename(file.path, ".jsonl");
 		sessionId = `${file.harness}:${baseId}`;
-		// Subagent logs under a session directory often have non-timestamp filenames
 		if (file.harness === "omp" && !/^\d{4}-\d{2}-\d{2}T/.test(baseId)) {
 			isNoise = true;
 		}
@@ -341,9 +358,16 @@ export function parseFileSession(file: DiscoveredFile): ParsedSession | null {
 		sourceKey: file.sourceKey,
 		id: sessionId,
 		harness: file.harness,
-		project: file.harness === "agy" ? (cwd ? deriveProjectFromPath(cwd) : "global") : deriveProjectFromPath(cwd || basename(join(file.path, ".."))),
+		project:
+			file.harness === "agy"
+				? cwd
+					? deriveProjectFromPath(cwd, opts?.worktreeSuffixes, opts?.workspaceRoots)
+					: "global"
+				: deriveProjectFromPath(cwd || basename(join(file.path, "..")), opts?.worktreeSuffixes, opts?.workspaceRoots),
 		cwd,
 		title: title || basename(file.path),
+		firstUserMsg,
+		lastUserMsg,
 		sourcePath: file.path,
 		startedAt: startedAt || fallbackIso,
 		updatedAt: updatedAt || fallbackIso,
@@ -354,17 +378,23 @@ export function parseFileSession(file: DiscoveredFile): ParsedSession | null {
 	};
 }
 
-export function loadOpenCodeSessions(homeDir = homedir()): {
+export function loadOpenCodeSessions(
+	homeDir = homedir(),
+	existingUpdated?: Map<string, string>,
+	opts?: { worktreeSuffixes?: readonly string[]; workspaceRoots?: readonly string[] },
+): {
 	dbPath: string;
 	mtimeMs: number;
 	sizeBytes: number;
 	sessions: ParsedSession[];
+	skippedSessions: number;
 } | null {
 	const dbPath = join(homeDir, ".local", "share", "opencode", "opencode.db");
 	if (!existsSync(dbPath)) return null;
 	const st = statSync(dbPath);
 	const db = new Database(dbPath, { readonly: true });
 	try {
+		db.exec("PRAGMA busy_timeout = 3000;");
 		const rawSessions = db
 			.query("SELECT id, directory, title, time_created, time_updated, parent_id FROM session ORDER BY time_updated DESC")
 			.all() as Array<{
@@ -376,45 +406,85 @@ export function loadOpenCodeSessions(homeDir = homedir()): {
 			parent_id: string | null;
 		}>;
 
-		const msgStmt = db.query("SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created ASC");
-		const partStmt = db.query("SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC");
+		const changedSessions: typeof rawSessions = [];
+		let skippedSessions = 0;
+		for (const s of rawSessions) {
+			const updatedIso = s.time_updated ? new Date(s.time_updated).toISOString() : new Date(st.mtimeMs).toISOString();
+			const prev = existingUpdated?.get(`opencode:${s.id}`);
+			if (prev && prev === updatedIso) {
+				skippedSessions++;
+				continue;
+			}
+			changedSessions.push(s);
+		}
+		if (changedSessions.length === 0) {
+			return { dbPath, mtimeMs: Math.floor(st.mtimeMs), sizeBytes: st.size, sessions: [], skippedSessions };
+		}
+
+		const msgStmt = db.query(
+			`SELECT m.id, m.time_created, m.data as msg_data, p.data as part_data
+			 FROM message m
+			 LEFT JOIN part p ON p.message_id = m.id
+			 WHERE m.session_id = ?
+			 ORDER BY m.time_created ASC, p.time_created ASC`,
+		);
 
 		const sessions: ParsedSession[] = [];
-		for (const s of rawSessions) {
-			const rawMsgs = msgStmt.all(s.id) as Array<{ id: string; time_created: number; data: string }>;
-			const messages: ParsedMessage[] = [];
-			for (const m of rawMsgs) {
-				let meta: Record<string, unknown>;
-				try {
-					meta = JSON.parse(m.data) as Record<string, unknown>;
-				} catch {
-					continue;
-				}
-				const role = meta.role;
-				if (role !== "user" && role !== "assistant") continue;
-				const parts = partStmt.all(m.id) as Array<{ data: string }>;
-				const texts: string[] = [];
-				for (const p of parts) {
+		for (const s of changedSessions) {
+			const joinedRows = msgStmt.all(s.id) as Array<{
+				id: string;
+				time_created: number;
+				msg_data: string;
+				part_data: string | null;
+			}>;
+			const grouped = new Map<string, { role: "user" | "assistant"; time_created: number; texts: string[] }>();
+			for (const row of joinedRows) {
+				let entry = grouped.get(row.id);
+				if (!entry) {
+					let meta: Record<string, unknown>;
 					try {
-						const pd = JSON.parse(p.data) as Record<string, unknown>;
-						if (pd.type === "text" && typeof pd.text === "string") texts.push(pd.text);
+						meta = JSON.parse(row.msg_data) as Record<string, unknown>;
+					} catch {
+						continue;
+					}
+					if (meta.role !== "user" && meta.role !== "assistant") continue;
+					entry = { role: meta.role, time_created: row.time_created, texts: [] };
+					grouped.set(row.id, entry);
+				}
+				if (row.part_data) {
+					try {
+						const pd = JSON.parse(row.part_data) as Record<string, unknown>;
+						if (pd.type === "text" && typeof pd.text === "string") entry.texts.push(pd.text);
 					} catch {
 						// ignore
 					}
 				}
-				const cleaned = cleanMessageText(texts.join("\n"));
+			}
+
+			const messages: ParsedMessage[] = [];
+			let firstUserMsg = "";
+			let lastUserMsg = "";
+			for (const entry of grouped.values()) {
+				const cleaned = cleanMessageText(entry.texts.join("\n"));
 				if (!cleaned) continue;
-				const ts = m.time_created ? new Date(m.time_created).toISOString() : "";
-				messages.push({ seq: messages.length + 1, role, ts, content: cleaned });
+				if (entry.role === "user") {
+					const ex = makeAnchorExcerpt(cleaned);
+					if (!firstUserMsg) firstUserMsg = ex;
+					lastUserMsg = ex;
+				}
+				const ts = entry.time_created ? new Date(entry.time_created).toISOString() : "";
+				messages.push({ seq: messages.length + 1, role: entry.role, ts, content: cleaned });
 			}
 			if (messages.length === 0) continue;
 			sessions.push({
 				sourceKey: `opencode:${s.id}`,
 				id: `opencode:${s.id}`,
 				harness: "opencode",
-				project: deriveProjectFromPath(s.directory || ""),
+				project: deriveProjectFromPath(s.directory || "", opts?.worktreeSuffixes, opts?.workspaceRoots),
 				cwd: s.directory || "",
 				title: s.title || messages[0]!.content.slice(0, 80),
+				firstUserMsg,
+				lastUserMsg,
 				sourcePath: dbPath,
 				startedAt: s.time_created ? new Date(s.time_created).toISOString() : new Date(st.mtimeMs).toISOString(),
 				updatedAt: s.time_updated ? new Date(s.time_updated).toISOString() : new Date(st.mtimeMs).toISOString(),
@@ -424,23 +494,29 @@ export function loadOpenCodeSessions(homeDir = homedir()): {
 				messages,
 			});
 		}
-		return { dbPath, mtimeMs: Math.floor(st.mtimeMs), sizeBytes: st.size, sessions };
+		return { dbPath, mtimeMs: Math.floor(st.mtimeMs), sizeBytes: st.size, sessions, skippedSessions };
 	} finally {
 		db.close();
 	}
 }
 
-export function loadHermesSessions(homeDir = homedir()): {
+export function loadHermesSessions(
+	homeDir = homedir(),
+	existingUpdated?: Map<string, string>,
+	opts?: { worktreeSuffixes?: readonly string[]; workspaceRoots?: readonly string[] },
+): {
 	dbPath: string;
 	mtimeMs: number;
 	sizeBytes: number;
 	sessions: ParsedSession[];
+	skippedSessions: number;
 } | null {
 	const dbPath = join(homeDir, ".hermes", "state.db");
 	if (!existsSync(dbPath)) return null;
 	const st = statSync(dbPath);
 	const db = new Database(dbPath, { readonly: true });
 	try {
+		db.exec("PRAGMA busy_timeout = 3000;");
 		const rawSessions = db
 			.query(
 				`SELECT id, source, display_name, cwd, started_at, ended_at, parent_session_id
@@ -456,6 +532,22 @@ export function loadHermesSessions(homeDir = homedir()): {
 			parent_session_id: string | null;
 		}>;
 
+		const changedSessions: Array<{ row: (typeof rawSessions)[number]; startedIso: string; updatedIso: string }> = [];
+		let skippedSessions = 0;
+		for (const s of rawSessions) {
+			const startedIso = s.started_at ? new Date(s.started_at * 1000).toISOString() : new Date(st.mtimeMs).toISOString();
+			const updatedIso = s.ended_at ? new Date(s.ended_at * 1000).toISOString() : startedIso;
+			const prev = existingUpdated?.get(`hermes:${s.id}`);
+			if (prev && prev === updatedIso && s.ended_at !== null) {
+				skippedSessions++;
+				continue;
+			}
+			changedSessions.push({ row: s, startedIso, updatedIso });
+		}
+		if (changedSessions.length === 0) {
+			return { dbPath, mtimeMs: Math.floor(st.mtimeMs), sizeBytes: st.size, sessions: [], skippedSessions };
+		}
+
 		const msgStmt = db.query(
 			`SELECT role, content, timestamp FROM messages
 			 WHERE session_id = ? AND role IN ('user', 'assistant') AND COALESCE(_compressed_summary, 0) = 0
@@ -464,26 +556,33 @@ export function loadHermesSessions(homeDir = homedir()): {
 
 		const noiseSources = new Set(["cron", "subagent", "kanban", "tool"]);
 		const sessions: ParsedSession[] = [];
-		for (const s of rawSessions) {
+		for (const { row: s, startedIso, updatedIso } of changedSessions) {
 			const rawMsgs = msgStmt.all(s.id) as Array<{ role: "user" | "assistant"; content: string | null; timestamp: number }>;
 			const messages: ParsedMessage[] = [];
+			let firstUserMsg = "";
+			let lastUserMsg = "";
 			for (const m of rawMsgs) {
 				if (!m.content) continue;
 				const cleaned = cleanMessageText(m.content);
 				if (!cleaned) continue;
+				if (m.role === "user") {
+					const ex = makeAnchorExcerpt(cleaned);
+					if (!firstUserMsg) firstUserMsg = ex;
+					lastUserMsg = ex;
+				}
 				const ts = m.timestamp ? new Date(m.timestamp * 1000).toISOString() : "";
 				messages.push({ seq: messages.length + 1, role: m.role, ts, content: cleaned });
 			}
 			if (messages.length === 0) continue;
-			const startedIso = s.started_at ? new Date(s.started_at * 1000).toISOString() : new Date(st.mtimeMs).toISOString();
-			const updatedIso = s.ended_at ? new Date(s.ended_at * 1000).toISOString() : startedIso;
 			sessions.push({
 				sourceKey: `hermes:${s.id}`,
 				id: `hermes:${s.id}`,
 				harness: "hermes",
-				project: deriveProjectFromPath(s.cwd || ""),
+				project: deriveProjectFromPath(s.cwd || "", opts?.worktreeSuffixes, opts?.workspaceRoots),
 				cwd: s.cwd || "",
 				title: s.display_name || messages[0]!.content.slice(0, 80),
+				firstUserMsg,
+				lastUserMsg,
 				sourcePath: dbPath,
 				startedAt: startedIso,
 				updatedAt: updatedIso,
@@ -493,7 +592,7 @@ export function loadHermesSessions(homeDir = homedir()): {
 				messages,
 			});
 		}
-		return { dbPath, mtimeMs: Math.floor(st.mtimeMs), sizeBytes: st.size, sessions };
+		return { dbPath, mtimeMs: Math.floor(st.mtimeMs), sizeBytes: st.size, sessions, skippedSessions };
 	} finally {
 		db.close();
 	}

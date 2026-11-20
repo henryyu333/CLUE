@@ -1,4 +1,4 @@
-import { mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const LOCK_STALE_MS = 30_000;
@@ -52,12 +52,58 @@ export function withMemoryLock<T>(lockDir: string, fn: () => T): T {
 	}
 }
 
+export function setFileReadOnly(filePath: string): void {
+	if (!existsSync(filePath)) return;
+	try {
+		chmodSync(filePath, 0o444);
+	} catch {
+		// Ignore permission errors on filesystems that don't support POSIX modes
+	}
+}
+
+export function setFileWritable(filePath: string): void {
+	if (!existsSync(filePath)) return;
+	try {
+		chmodSync(filePath, 0o644);
+	} catch {
+		// Ignore permission errors on filesystems that don't support POSIX modes
+	}
+}
+
+export function lockFilesReadOnly(files: readonly string[]): string[] {
+	const locked: string[] = [];
+	for (const f of files) {
+		if (!existsSync(f)) continue;
+		setFileReadOnly(f);
+		locked.push(f);
+	}
+	return locked;
+}
+
+export function unlockFilesWritable(files: readonly string[]): string[] {
+	const unlocked: string[] = [];
+	for (const f of files) {
+		if (!existsSync(f)) continue;
+		setFileWritable(f);
+		unlocked.push(f);
+	}
+	return unlocked;
+}
+
 /**
  * Atomic file write via temp file + rename in the same directory.
+ * Optionally marks the destination file read-only (0444) to deter direct edits bypassing clue.
  */
-export function atomicWriteFileSync(targetPath: string, content: string): void {
+export function atomicWriteFileSync(targetPath: string, content: string, opts?: { readOnly?: boolean }): void {
 	mkdirSync(dirname(targetPath), { recursive: true });
 	const tmpPath = `${targetPath}.tmp.${process.pid}.${Date.now()}`;
 	writeFileSync(tmpPath, content, "utf8");
+	if (existsSync(targetPath)) {
+		// Ensure replacement works cleanly on platforms where overwriting a read-only target fails
+		setFileWritable(targetPath);
+	}
 	renameSync(tmpPath, targetPath);
+	if (opts?.readOnly) {
+		setFileReadOnly(targetPath);
+	}
 }

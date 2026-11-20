@@ -1,5 +1,6 @@
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import type { ClueConfig, CluePaths } from "./config.ts";
+import { detectUnauthorizedChanges } from "./git.ts";
 import { evaluateMemoryHealth } from "./health.ts";
 import { classifyPromptIntent } from "./intent.ts";
 import { readHotMemoryView } from "./markdown.ts";
@@ -19,14 +20,20 @@ export interface BootSnapshot {
 }
 
 export function buildBootSnapshot(config: ClueConfig, paths: CluePaths, cwd: string): BootSnapshot {
-	const projectKey = resolveProjectKey(cwd);
+	const projectKey = resolveProjectKey(cwd, config.workspaceRoots);
 	const view = readHotMemoryView(config, paths, projectKey);
 	const health = evaluateMemoryHealth(config, paths, projectKey);
+	const tampering = detectUnauthorizedChanges(paths.home);
 
 	const sections: string[] = [
 		`<clue-memory profile="${view.profileChars}/${config.limits.profileChars} chars (${view.profilePct}%)" project="${projectKey ?? "none"}">`,
 		"以下为用户的长期个人画像与当前项目偏好（只读冻结快照；与当前明确指令或仓库实况冲突时以当前为准）。平时静默只读、绝不偷写记忆；遇到历史报错或疑难排障可按需运行 `clue search \"<关键词>\"` 查踩坑线索。",
 	];
+	if (tampering.dirty) {
+		sections.push(
+			`## INTEGRITY WARNING\n检测到记忆文件存在绕过 clue CLI 的未提交改动（${tampering.files.join(", ")}）。请告知用户核对 \`git -C "${paths.home}" diff\` 或运行 \`clue status\` 检查，切勿覆盖现场。`,
+		);
+	}
 	if (view.profileRaw.trim()) {
 		sections.push(`## PROFILE\n${view.profileRaw.trim()}`);
 	}
@@ -160,7 +167,20 @@ export function buildTurnNotice(
 	return notices.length > 0 ? notices.join("\n\n") : null;
 }
 
-const PROTECTED_FILENAMES = ["PROFILE.md", "PROJECTS.md", "pitfalls.db", "pitfalls.jsonl", "clue.meta.json"];
+const PROTECTED_FILENAMES = [
+	"PROFILE.md",
+	"PROJECTS.md",
+	"INTENTS.json",
+	"pitfalls.db",
+	"pitfalls.jsonl",
+	"decisions.jsonl",
+	"clue.meta.json",
+];
+
+function expandHomePath(raw: string): string {
+	if (raw.startsWith("~/")) return resolve(process.env.HOME ?? "", raw.slice(2));
+	return resolve(raw);
+}
 
 export function checkRawEditGuard(
 	paths: CluePaths,
@@ -169,6 +189,7 @@ export function checkRawEditGuard(
 ): { blocked: boolean; reason?: string } {
 	const normTool = toolName.toLowerCase();
 	const homeAbs = resolve(paths.home);
+	const homeDirName = basename(homeAbs);
 
 	// 1) Direct file write/edit tools across harnesses
 	const isFileWriteTool =
@@ -196,14 +217,16 @@ export function checkRawEditGuard(
 			.map(v => String(v));
 
 		for (const raw of candidatePaths) {
-			const expanded = raw.startsWith("~/") ? resolve(process.env.HOME ?? "", raw.slice(2)) : raw;
-			const hitsHome = expanded.includes(homeAbs) || raw.includes("personal-memory/");
-			const hitsProtected = PROTECTED_FILENAMES.some(f => raw.endsWith(f) || expanded.endsWith(`/${f}`));
+			const expanded = expandHomePath(raw);
+			const hitsHome = expanded === homeAbs || expanded.startsWith(`${homeAbs}/`) || expanded.startsWith(`${homeAbs}\\`);
+			const hitsProtected = PROTECTED_FILENAMES.some(
+				f => raw.endsWith(f) || expanded.endsWith(`/${f}`) || expanded.endsWith(`\\${f}`),
+			);
 			if (hitsHome && hitsProtected) {
 				return {
 					blocked: true,
 					reason:
-						"clue 门禁拦截：禁止绕过校验直接编辑个人记忆文件。请先给出修改草稿由用户确认，再通过 `clue curate` / `clue pitfall`（stdin JSON）安全写入。",
+						"clue 门禁拦截：禁止绕过校验直接编辑个人记忆文件。请通过 `clue curate` / `clue intent` / `clue pitfall` / `clue decision` 安全写入。",
 				};
 			}
 		}
@@ -215,20 +238,24 @@ export function checkRawEditGuard(
 	if (isShellTool) {
 		const cmd = String(args.CommandLine ?? args.command ?? args.cmd ?? "");
 		if (!cmd) return { blocked: false };
+		const cmdMentionsHome =
+			cmd.includes(homeAbs) ||
+			cmd.includes("$CLUE_HOME") ||
+			cmd.includes("${CLUE_HOME}") ||
+			(homeDirName.length > 0 && cmd.includes(`${homeDirName}/`));
 		const lines = cmd.split(/\r?\n/);
 		for (const line of lines) {
 			const touchesProtected =
-				(line.includes(homeAbs) || line.includes("personal-memory/")) &&
-				PROTECTED_FILENAMES.some(f => line.includes(f));
+				(cmdMentionsHome || line.includes(homeAbs)) && PROTECTED_FILENAMES.some(f => line.includes(f));
 			if (!touchesProtected) continue;
 			const isCluePipe = /\|\s*(?:~\/\.local\/bin\/|\/[^\s]*\/)?clue\b/.test(line);
 			const isClueCli = /^\s*(?:CLUE_HOME=\S+\s+)?(?:~\/\.local\/bin\/|\/[^\s]*\/)?clue\b/.test(line);
-			const looksLikeDirectWrite = /(?:>|>>|\btee\b|\bsed\s+-i|\brm\b|\bmv\b|\bperl\s+-i|\bpython.*write)/i.test(line);
+			const looksLikeDirectWrite = /(?:>|>>|\btee\b|\bsed\s+-i|\brm\b|\bmv\b|\bchmod\b|\bperl\s+-i|\bpython.*write)/i.test(line);
 			if (looksLikeDirectWrite && !isClueCli && !isCluePipe) {
 				return {
 					blocked: true,
 					reason:
-						"clue 门禁拦截：禁止通过 shell 重定向/覆盖命令直接篡改个人记忆文件。请使用 `clue curate` / `clue pitfall` / `clue undo`。",
+						"clue 门禁拦截：禁止通过 shell 重定向/覆盖命令直接篡改个人记忆文件。请使用 `clue` CLI 命令操作。",
 				};
 			}
 		}

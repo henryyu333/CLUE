@@ -8,42 +8,58 @@ interface SecurityRule {
 	name: string;
 	pattern: RegExp;
 	message: string;
+	redactPattern?: RegExp;
+	redactReplacement?: string;
 }
 
 const SECRET_RULES: readonly SecurityRule[] = [
 	{
 		name: "private-key-block",
 		pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
+		redactPattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+		redactReplacement: "[REDACTED]",
 		message: "检测到私钥 PEM 块，禁止写入个人记忆。",
 	},
 	{
 		name: "openai-anthropic-key",
 		pattern: /\b(?:sk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{20,})\b/,
+		redactPattern: /\b(?:sk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{20,})\b/g,
+		redactReplacement: "[REDACTED]",
 		message: "检测到疑似 OpenAI / Anthropic / Stripe API Key，禁止写入个人记忆。",
 	},
 	{
 		name: "github-token",
 		pattern: /\b(?:ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|gho_[A-Za-z0-9]{30,})\b/,
+		redactPattern: /\b(?:ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|gho_[A-Za-z0-9]{30,})\b/g,
+		redactReplacement: "[REDACTED]",
 		message: "检测到疑似 GitHub Token，禁止写入个人记忆。",
 	},
 	{
 		name: "aws-access-key",
 		pattern: /\bAKIA[0-9A-Z]{16}\b/,
+		redactPattern: /\bAKIA[0-9A-Z]{16}\b/g,
+		redactReplacement: "[REDACTED]",
 		message: "检测到疑似 AWS Access Key，禁止写入个人记忆。",
 	},
 	{
 		name: "google-api-key",
 		pattern: /\bAIza[0-9A-Za-z_-]{35}\b/,
+		redactPattern: /\bAIza[0-9A-Za-z_-]{35}\b/g,
+		redactReplacement: "[REDACTED]",
 		message: "检测到疑似 Google API Key，禁止写入个人记忆。",
 	},
 	{
 		name: "bearer-or-jwt",
 		pattern: /\b(?:Bearer\s+[A-Za-z0-9._-]{20,}|eyJ[A-Za-z0-9_-]{12,}\.eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})\b/,
+		redactPattern: /\b(?:Bearer\s+[A-Za-z0-9._-]{20,}|eyJ[A-Za-z0-9_-]{12,}\.eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})\b/g,
+		redactReplacement: "[REDACTED]",
 		message: "检测到疑似 Bearer Token 或 JWT 凭据，禁止写入个人记忆。",
 	},
 	{
 		name: "explicit-secret-assignment",
 		pattern: /\b(?:api[_-]?key|access[_-]?token|secret[_-]?key|password|passwd|client[_-]?secret)\s*[:=]\s*["']?[A-Za-z0-9_/+=-]{12,}["']?/i,
+		redactPattern: /(\b(?:api[_-]?key|access[_-]?token|secret[_-]?key|password|passwd|client[_-]?secret)\s*[:=]\s*["']?)[A-Za-z0-9_/+=-]{12,}(["']?)/gi,
+		redactReplacement: "$1[REDACTED]$2",
 		message: "检测到疑似明文密钥或密码赋值，禁止写入个人记忆（如需提及，请只记录环境变量名）。",
 	},
 ];
@@ -74,4 +90,18 @@ export function scanMemoryContent(text: string): SecurityScanResult {
 		}
 	}
 	return { ok: true };
+}
+
+/**
+ * Shared secret scrubber used by both transcript recall indexing and web exports.
+ */
+export function redactSecrets(text: string): string {
+	if (!text) return "";
+	let out = text;
+	for (const rule of SECRET_RULES) {
+		if (rule.redactPattern) {
+			out = out.replace(rule.redactPattern, rule.redactReplacement ?? "[REDACTED]");
+		}
+	}
+	return out;
 }

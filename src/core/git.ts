@@ -1,6 +1,21 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { lockFilesReadOnly, unlockFilesWritable } from "./lock.ts";
+
+const MONITORED_MEMORY_FILES = new Set([
+	"PROFILE.md",
+	"PROJECTS.md",
+	"INTENTS.json",
+	"pitfalls.jsonl",
+	"decisions.jsonl",
+]);
+
+export interface UnauthorizedChangeReport {
+	dirty: boolean;
+	files: string[];
+	diffSummary: string;
+}
 
 export function ensureMemoryGit(memDir: string): void {
 	if (existsSync(join(memDir, ".git"))) return;
@@ -19,6 +34,52 @@ export function commitMemoryGit(memDir: string, message: string): string | null 
 		return execFileSync("git", ["-C", memDir, "rev-parse", "--short", "HEAD"], { encoding: "utf8" }).trim();
 	} catch {
 		return null;
+	}
+}
+
+/**
+ * Fast (~3ms) sentinel check: detects edits made to monitored memory files outside the clue CLI.
+ */
+export function detectUnauthorizedChanges(memDir: string): UnauthorizedChangeReport {
+	try {
+		if (!existsSync(join(memDir, ".git"))) {
+			return { dirty: false, files: [], diffSummary: "" };
+		}
+		// Ensure there is at least one commit before reporting uncommitted edits as tampering
+		const hasHead = countCommitsSince(memDir, null) > 0;
+		if (!hasHead) {
+			return { dirty: false, files: [], diffSummary: "" };
+		}
+		const raw = execFileSync("git", ["-C", memDir, "status", "--porcelain"], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trimEnd();
+		if (!raw) return { dirty: false, files: [], diffSummary: "" };
+
+		const dirtyFiles: string[] = [];
+		for (const line of raw.split("\n")) {
+			if (line.length < 4) continue;
+			const file = line.slice(3).trim().replace(/^"|"$/g, "");
+			if (MONITORED_MEMORY_FILES.has(file)) {
+				dirtyFiles.push(file);
+			}
+		}
+		if (dirtyFiles.length === 0) {
+			return { dirty: false, files: [], diffSummary: "" };
+		}
+
+		let diffSummary = "";
+		try {
+			diffSummary = execFileSync("git", ["-C", memDir, "diff", "--stat", "--", ...dirtyFiles], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "ignore"],
+			}).trim();
+		} catch {
+			// ignore
+		}
+		return { dirty: true, files: dirtyFiles, diffSummary };
+	} catch {
+		return { dirty: false, files: [], diffSummary: "" };
 	}
 }
 
@@ -51,7 +112,11 @@ export function countCommitsSince(memDir: string, sinceIso: string | null): numb
 	}
 }
 
-export function undoLastMemoryCommit(memDir: string): { ok: boolean; message: string; commit?: string } {
+export function undoLastMemoryCommit(
+	memDir: string,
+	options?: { guardedFiles?: readonly string[]; restoreReadOnly?: boolean },
+): { ok: boolean; message: string; commit?: string } {
+	const guarded = options?.guardedFiles ?? [];
 	try {
 		if (!existsSync(join(memDir, ".git"))) {
 			return { ok: false, message: "记忆目录尚未初始化 Git，无可撤回记录。" };
@@ -59,6 +124,9 @@ export function undoLastMemoryCommit(memDir: string): { ok: boolean; message: st
 		const count = countCommitsSince(memDir, null);
 		if (count <= 1) {
 			return { ok: false, message: "当前仅剩初始提交，为防止清空记忆，不允许继续 undo。" };
+		}
+		if (guarded.length > 0) {
+			unlockFilesWritable(guarded);
 		}
 		const lastLine = getRecentMemoryCommits(memDir, 1)[0] ?? "";
 		execFileSync("git", ["-C", memDir, "revert", "--no-edit", "HEAD"], {
@@ -80,5 +148,9 @@ export function undoLastMemoryCommit(memDir: string): { ok: boolean; message: st
 			ok: false,
 			message: `撤回失败：${err instanceof Error ? err.message : String(err)}`,
 		};
+	} finally {
+		if (options?.restoreReadOnly && guarded.length > 0) {
+			lockFilesReadOnly(guarded);
+		}
 	}
 }

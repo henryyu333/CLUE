@@ -1,8 +1,15 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { indexRecallSessions, recallSessions, redactSecrets, showSessionWindow } from "../src/recall/index.ts";
+import {
+	getRecentProjectSessionAnchors,
+	indexRecallSessions,
+	recallSessions,
+	redactSecrets,
+	showSessionWindow,
+} from "../src/recall/index.ts";
 
 let fakeHome: string;
 let recallDb: string;
@@ -105,5 +112,60 @@ describe("cross-harness recall & redaction", () => {
 		expect(codexHits.length).toBe(1);
 		expect(codexHits[0]!.harness).toBe("codex");
 		expect(codexHits[0]!.project).toBe("acme");
+
+		// Empty query with --role assistant should return assistant messages cleanly
+		const assistantOnly = recallSessions(recallDb, { query: "", role: "assistant" });
+		expect(assistantOnly.length).toBe(2);
+		expect(assistantOnly[0]!.role).toBe("assistant");
+
+		// Recent project anchors include firstUserMsg and lastUserMsg
+		const anchors = getRecentProjectSessionAnchors(recallDb, "acme", { limit: 2 });
+		expect(anchors.length).toBe(1);
+		expect(anchors[0]!.firstUserMsg).toContain("focus trap");
+	});
+
+	test("filters noise sessions unless includeNoise is true and incrementally syncs OpenCode SQLite", () => {
+		const ocDir = join(fakeHome, ".local", "share", "opencode");
+		mkdirSync(ocDir, { recursive: true });
+		const ocDbPath = join(ocDir, "opencode.db");
+		const ocDb = new Database(ocDbPath);
+		ocDb.exec(`
+			CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER, parent_id TEXT);
+			CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+			CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, time_created INTEGER, data TEXT);
+		`);
+		const t1 = Date.parse("2026-11-18T10:00:00Z");
+		const t2 = Date.parse("2026-11-18T11:00:00Z");
+		ocDb.query("INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)").run("s1", "/Users/alice/workspace/acme", "Main chat", t1, t1, null);
+		ocDb.query("INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)").run("s2", "/Users/alice/workspace/acme", "Subagent", t2, t2, "s1");
+		ocDb.query("INSERT INTO message VALUES (?, ?, ?, ?)").run("m1", "s1", t1, JSON.stringify({ role: "user" }));
+		ocDb.query("INSERT INTO part VALUES (?, ?, ?, ?)").run("p1", "m1", t1, JSON.stringify({ type: "text", text: "alpha protocol handshake design" }));
+		ocDb.query("INSERT INTO message VALUES (?, ?, ?, ?)").run("m2", "s2", t2, JSON.stringify({ role: "user" }));
+		ocDb.query("INSERT INTO part VALUES (?, ?, ?, ?)").run("p2", "m2", t2, JSON.stringify({ type: "text", text: "alpha protocol subagent noise" }));
+		ocDb.close();
+
+		const run1 = indexRecallSessions(recallDb, { homeDir: fakeHome, harness: "opencode" });
+		expect(run1.indexedSessions).toBe(2);
+
+		// Default recall hides noise subagent session
+		const cleanHits = recallSessions(recallDb, { query: "alpha protocol" });
+		expect(cleanHits.length).toBe(1);
+		expect(cleanHits[0]!.sessionId).toBe("opencode:s1");
+
+		// includeNoise: true returns both
+		const allHits = recallSessions(recallDb, { query: "alpha protocol", includeNoise: true });
+		expect(allHits.length).toBe(2);
+
+		// Add a 3rd session in opencode.db; incremental sync should only index the 1 new session (skip s1 & s2)
+		const ocDb2 = new Database(ocDbPath);
+		const t3 = Date.parse("2026-11-19T12:00:00Z");
+		ocDb2.query("INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)").run("s3", "/Users/alice/workspace/acme", "Second chat", t3, t3, null);
+		ocDb2.query("INSERT INTO message VALUES (?, ?, ?, ?)").run("m3", "s3", t3, JSON.stringify({ role: "user" }));
+		ocDb2.query("INSERT INTO part VALUES (?, ?, ?, ?)").run("p3", "m3", t3, JSON.stringify({ type: "text", text: "beta incremental check" }));
+		ocDb2.close();
+
+		const run2 = indexRecallSessions(recallDb, { homeDir: fakeHome, harness: "opencode" });
+		expect(run2.indexedSessions).toBe(1);
+		expect(run2.skippedUnchanged).toBe(2);
 	});
 });
