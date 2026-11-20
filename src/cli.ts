@@ -53,7 +53,7 @@ import {
 } from "./recall/index.ts";
 import { inspectHarnessAdapters, installHarnessAdapter, type InstallTarget } from "./adapters/install.ts";
 
-const VERSION = "0.5";
+const VERSION = "0.5.1";
 
 function parseArgs(argv: string[]): { positionals: string[]; flags: Record<string, string | boolean> } {
 	const positionals: string[] = [];
@@ -251,26 +251,29 @@ async function runHookCommand(sub: string, flags: Record<string, string | boolea
 			}
 		}
 
-		let notice = buildTurnNotice(config, paths, promptText, cwd);
-		if (notice && (harness === "agy" || harness === "hermes") && convId) {
+		// Deduplicate the entire user turn across repeated PreInvocation callbacks within the same turn (e.g. after tool calls in AGY)
+		let isDuplicateTurnCallback = false;
+		if ((harness === "agy" || harness === "hermes") && convId && promptText.trim()) {
 			const fp = createHash("sha1").update(`${initialNumSteps}:${promptText}`).digest("hex");
-			if (wasHookTurnSeen(`prompt:${harness}:${convId}`, fp)) {
-				notice = null;
-			}
+			isDuplicateTurnCallback = wasHookTurnSeen(`prompt:${harness}:${convId}`, fp);
 		}
-		if (notice) blocks.push(notice);
 
-		// Pure-local (<15ms) high-confidence flashback for ordinary technical turns (deduplicated per session)
-		if (!notice && config.autoRecall && promptText.trim()) {
-			const projKey = resolveProjectKey(cwd, config.workspaceRoots);
-			const fbScope = convId ? `fb:${harness}:${convId}` : "";
-			const shown = fbScope ? readShownFlashbackKeys(fbScope) : new Set<string>();
-			const fb = buildProactiveFlashback(config, paths, promptText, projKey, shown, convId || undefined);
-			if (fb.notice) {
-				blocks.push(fb.notice);
-				if (fbScope) {
-					for (const item of fb.items) shown.add(item.key);
-					saveShownFlashbackKeys(fbScope, shown);
+		if (!isDuplicateTurnCallback) {
+			const notice = buildTurnNotice(config, paths, promptText, cwd);
+			if (notice) {
+				blocks.push(notice);
+			} else if (config.autoRecall && promptText.trim()) {
+				// Pure-local (<15ms) high-confidence flashback for ordinary technical turns (deduplicated per session)
+				const projKey = resolveProjectKey(cwd, config.workspaceRoots);
+				const fbScope = convId ? `fb:${harness}:${convId}` : "";
+				const shown = fbScope ? readShownFlashbackKeys(fbScope) : new Set<string>();
+				const fb = buildProactiveFlashback(config, paths, promptText, projKey, shown, convId || undefined);
+				if (fb.notice) {
+					blocks.push(fb.notice);
+					if (fbScope) {
+						for (const item of fb.items) shown.add(item.key);
+						saveShownFlashbackKeys(fbScope, shown);
+					}
 				}
 			}
 		}

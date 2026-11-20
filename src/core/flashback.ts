@@ -16,21 +16,32 @@ export interface FlashbackResult {
 	items: FlashbackItem[];
 }
 
+// Generic English prose + broad AI/dev/platform words that should NEVER trigger flashback on their own
 const ASCII_STOPWORDS = new Set([
 	"the", "and", "for", "that", "this", "with", "from", "have", "what", "when", "where", "which", "would",
 	"could", "should", "about", "there", "their", "please", "thanks", "thank", "hello", "help", "just",
 	"like", "make", "need", "want", "code", "file", "files", "test", "tests", "work", "done", "okay", "sure",
 	"good", "fine", "true", "false", "null", "none", "auto", "only", "also", "more", "some", "into", "over",
 	"then", "than", "here", "does", "dont", "cant", "will", "your", "mine", "ours", "clue", "project", "memory",
+	"github", "claude", "chatgpt", "openai", "gemini", "codex", "hermes", "opencode", "cursor", "windsurf",
+	"harness", "harnesses", "agent", "agents", "model", "models", "release", "releases", "version", "versions",
+	"plugin", "plugins", "hook", "hooks", "skill", "skills", "local", "cloud", "sync", "vector", "prompt",
+	"system", "config", "update", "build", "error", "errors", "issue", "issues", "commit", "branch", "merge",
+	"main", "push", "pull", "draft", "review", "check", "start", "close", "status", "search", "recall",
+	"index", "dream", "export", "install", "doctor", "debug", "readme", "markdown", "json", "yaml", "sqlite",
+	"script", "window", "panel", "button", "style", "color", "click", "focus", "input", "output", "value",
+	"string", "number", "array", "object", "async", "await", "return", "import", "const", "function", "class",
+	"interface", "type", "tool", "tools", "chat", "session", "sessions", "note", "notes", "rule", "rules",
 ]);
 
 const CJK_STOP_RE =
-	/(?:今天|明天|昨天|一下|帮我|看看|怎么|为什么|出现|遇到|问题|处理|修复|解决|关于|时候|还是|依然|不能|无法|一个|这个|那个|可以|没有|需要|觉得|应该|目前|现在|已经|如果|或者|就是|然后|因为|所以|但是|不过|其实|大概|一下吧|好的|谢谢|继续|没事了|先这样|收尾|收工|开工)/g;
+	/(?:今天|明天|昨天|一下|帮我|看看|怎么|为什么|出现|遇到|问题|处理|修复|解决|关于|时候|还是|依然|不能|无法|一个|这个|那个|可以|没有|需要|觉得|应该|目前|现在|已经|如果|或者|就是|然后|因为|所以|但是|不过|其实|大概|一下吧|好的|谢谢|继续|没事了|先这样|收尾|收工|开工|记忆|系统|工具|模型|版本|发布|网页版|对齐|完美|放心|直接|向量|语义|检索|需要吗|可以吗|对吧|对吗)/g;
 
 const RETROSPECTIVE_RE =
 	/(?:上次|之前|以前|先前|那次|记得|聊过|定过|怎么定|为啥选|为什么选|之前踩过|原来怎么|当初|回顾|last\s+time|previously|earlier\s+we|what\s+did\s+we\s+decide)/i;
 
 interface ExtractedSignals {
+	/** High-specificity technical identifiers (error codes, paths, snake/camel/colons, non-generic technical names). */
 	strongTokens: string[];
 	cjkTokens: string[];
 	isRetrospective: boolean;
@@ -38,6 +49,16 @@ interface ExtractedSignals {
 
 function stripCodeFences(raw: string): string {
 	return raw.replace(/```[\s\S]*?```/g, " ").trim();
+}
+
+function isHighSpecificityToken(rawTok: string, lower: string): boolean {
+	if (ASCII_STOPWORDS.has(lower)) return false;
+	if (lower.length < 3) return false;
+	// Contains path/symbol/namespace/error separators, digits, snake_case, or internal camelCase/ALL_CAPS
+	if (/[_:/.-]/.test(rawTok) || /\d/.test(rawTok)) return true;
+	if (/[a-z][A-Z]/.test(rawTok) || /^[A-Z]{3,}$/.test(rawTok)) return true;
+	// Non-stopword 5+ char lowercase identifier (e.g. makensis, remotion, worktree, tailwind)
+	return lower.length >= 5;
 }
 
 export function extractFlashbackSignals(promptText: string): ExtractedSignals | null {
@@ -51,9 +72,10 @@ export function extractFlashbackSignals(promptText: string): ExtractedSignals | 
 
 	const strongSet = new Set<string>();
 	for (const m of cleaned.matchAll(/[a-zA-Z][a-zA-Z0-9_.:/-]{2,}|[A-Z0-9_]{3,}|[a-z]+_[a-z0-9_]+/g)) {
-		const tok = m[0].replace(/^[:./-]+|[:./-]+$/g, "").toLowerCase();
-		if (tok.length < 3 || ASCII_STOPWORDS.has(tok)) continue;
-		strongSet.add(tok);
+		const rawTok = m[0].replace(/^[:./-]+|[:./-]+$/g, "");
+		const lower = rawTok.toLowerCase();
+		if (!isHighSpecificityToken(rawTok, lower)) continue;
+		strongSet.add(lower);
 		if (strongSet.size >= 10) break;
 	}
 
@@ -88,24 +110,31 @@ function scoreHaystack(
 	itemProject: string,
 	currentProject: string | null,
 	signals: ExtractedSignals,
-): { score: number; strongHits: number; cjkHits: number } {
+): { score: number; strongHits: number; cjkHits: number; matchedTokens: string[] } {
 	const lower = haystack.toLowerCase();
+	const matchedTokens: string[] = [];
 	let strongHits = 0;
 	let cjkHits = 0;
 	for (const tok of signals.strongTokens) {
-		if (lower.includes(tok)) strongHits++;
+		if (lower.includes(tok)) {
+			strongHits++;
+			matchedTokens.push(tok);
+		}
 	}
 	for (const tok of signals.cjkTokens) {
-		if (lower.includes(tok)) cjkHits++;
+		if (lower.includes(tok)) {
+			cjkHits++;
+			matchedTokens.push(tok);
+		}
 	}
 	if (strongHits === 0 && cjkHits === 0) {
-		return { score: 0, strongHits: 0, cjkHits: 0 };
+		return { score: 0, strongHits: 0, cjkHits: 0, matchedTokens };
 	}
 	let score = strongHits * 3 + cjkHits * 1.5;
 	if (currentProject && itemProject.toLowerCase() === currentProject.toLowerCase()) {
 		score += 1;
 	}
-	return { score, strongHits, cjkHits };
+	return { score, strongHits, cjkHits, matchedTokens };
 }
 
 function truncateLine(text: string, maxLen: number): string {
@@ -138,15 +167,15 @@ export function buildProactiveFlashback(
 		const key = `pitfall:#${p.id}`;
 		if (seen.has(key)) continue;
 		const hay = `${p.project} ${p.tags} ${p.symptom} ${p.root_cause}`;
-		const { score, strongHits, cjkHits } = scoreHaystack(hay, p.project, projectKey, signals);
-		// High-confidence gate: >=1 strong technical token OR >=2 distinct CJK topic tokens
+		const { score, strongHits, cjkHits, matchedTokens } = scoreHaystack(hay, p.project, projectKey, signals);
+		// High-confidence gate: >=1 high-specificity technical token OR >=2 distinct CJK topic tokens
 		if (strongHits >= 1 || cjkHits >= 2) {
-			const hintQuery = signals.strongTokens[0] ?? signals.cjkTokens[0] ?? p.tags.split(",")[0]?.trim() ?? "";
+			const hintQuery = matchedTokens[0] ?? p.tags.split(",")[0]?.trim() ?? "";
 			const ev = p.evidence?.trim() ? `（溯源 ${truncateLine(p.evidence, 36)}）` : "";
 			candidates.push({
 				key,
 				kind: "pitfall",
-				score: score + 0.2, // slight preference for objective pitfalls
+				score: score + 0.2,
 				numericId: p.id,
 				line: `• [Pitfall #${p.id}] ${truncateLine(p.root_cause, 88)}${ev} → 详情 \`clue search "${hintQuery}"\``,
 			});
@@ -159,9 +188,9 @@ export function buildProactiveFlashback(
 		const key = `decision:#${d.id}`;
 		if (seen.has(key)) continue;
 		const hay = `${d.project} ${d.topic} ${d.decision} ${d.rationale} ${d.assumptions}`;
-		const { score, strongHits, cjkHits } = scoreHaystack(hay, d.project, projectKey, signals);
+		const { score, strongHits, cjkHits, matchedTokens } = scoreHaystack(hay, d.project, projectKey, signals);
 		if (strongHits >= 1 || cjkHits >= 2) {
-			const hintQuery = d.topic || signals.strongTokens[0] || signals.cjkTokens[0] || "";
+			const hintQuery = matchedTokens[0] || d.topic || "";
 			const revisit = d.revisit_when?.trim() ? `（推翻条件：${truncateLine(d.revisit_when, 36)}）` : "";
 			candidates.push({
 				key,
@@ -176,8 +205,12 @@ export function buildProactiveFlashback(
 	candidates.sort((a, b) => b.score - a.score);
 	const picked = candidates.slice(0, 2);
 
-	// 3) Optional verbatim recall hint ONLY when user explicitly refers to past discussions (or strong multi-token technical match with <2 structured hits)
-	if (picked.length < 2 && (signals.isRetrospective || signals.strongTokens.length >= 2)) {
+	// 3) Verbatim recall hint ONLY on explicit retrospective phrasing + concrete topic tokens (never on casual mentions)
+	if (
+		picked.length < 2 &&
+		signals.isRetrospective &&
+		signals.strongTokens.length + signals.cjkTokens.length >= 2
+	) {
 		const queryTokens = [...signals.strongTokens.slice(0, 3), ...signals.cjkTokens.slice(0, 2)].slice(0, 4);
 		if (queryTokens.length > 0) {
 			const recallHits = recallSessions(paths.recallDbPath, {

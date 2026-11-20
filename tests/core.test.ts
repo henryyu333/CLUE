@@ -614,14 +614,23 @@ describe("v0.4 project 4-slot intent cards, decisions, continuity & proactive fl
 			config.readOnlyGuard,
 		);
 
-		// Short chitchat stays 100% silent
+		// Short chitchat and broad product-name prose stay 100% silent (no false positives on github/claude/chatgpt/harness)
 		expect(buildProactiveFlashback(config, paths, "好的，继续", "demo").notice).toBeNull();
 		expect(buildProactiveFlashback(config, paths, "今天天气不错呀", "demo").notice).toBeNull();
+		expect(
+			buildProactiveFlashback(
+				config,
+				paths,
+				"GitHub 上的新版本发布完了吗？这个 harness memory 比 ChatGPT 和 Claude 网页版好吗？",
+				"demo",
+			).notice,
+		).toBeNull();
 
 		// Strong technical prompt triggers crisp flashback and increments hit_count
 		const shown = new Set<string>();
 		const fb1 = buildProactiveFlashback(config, paths, "排查一下 makensis 报错 std::bad_alloc 怎么回事", "demo", shown);
 		expect(fb1.notice).toContain("Pitfall #1");
+		expect(fb1.notice).toContain('clue search "makensis"');
 		expect(fb1.items.length).toBe(1);
 		for (const it of fb1.items) shown.add(it.key);
 
