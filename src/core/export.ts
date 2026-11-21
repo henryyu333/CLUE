@@ -1,8 +1,7 @@
 import type { ClueConfig, CluePaths } from "./config.ts";
-import { listActiveDecisions } from "./decisions.ts";
 import { formatIntentCard, getProjectIntent } from "./intents.ts";
+import { listActive, type DecisionRow, type NoteRow, type PitfallRow } from "./ledger.ts";
 import { readHotMemoryView } from "./markdown.ts";
-import { listActivePitfalls } from "./pitfalls.ts";
 import { redactSecrets } from "./security.ts";
 
 export interface WebExportBundle {
@@ -23,8 +22,9 @@ export function buildWebExportBundle(
 ): WebExportBundle {
 	const view = readHotMemoryView(config, paths, projectKey);
 	const intentCard = getProjectIntent(paths.intentsPath, projectKey);
-	const decisions = listActiveDecisions(paths.dbPath, projectKey).slice(0, 8);
-	const pitfalls = listActivePitfalls(paths.dbPath, projectKey).slice(0, 6);
+	const decisions = listActive<DecisionRow>(paths, "decision", projectKey).slice(0, 8);
+	const pitfalls = listActive<PitfallRow>(paths, "pitfall", projectKey).slice(0, 6);
+	const notes = listActive<NoteRow>(paths, "note", projectKey).slice(0, 10);
 
 	const parts: string[] = [
 		`# Local Context Snapshot (project: ${projectKey ?? "general"})`,
@@ -56,6 +56,9 @@ export function buildWebExportBundle(
 			"## Known Pitfalls (Root Causes)\n" +
 				pitfalls.map(p => `- [${p.project}] ${p.symptom} -> ${p.root_cause}`).join("\n"),
 		);
+	}
+	if (notes.length > 0) {
+		parts.push(`## Personal Notes\n${notes.map(n => `- [${n.project}] ${n.content}`).join("\n")}`);
 	}
 
 	const scrubbed = redactSecrets(parts.join("\n\n"));

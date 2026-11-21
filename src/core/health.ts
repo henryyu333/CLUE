@@ -2,12 +2,11 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ClueConfig, CluePaths } from "./config.ts";
-import { listActiveDecisions, type DecisionRow } from "./decisions.ts";
 import { countCommitsSince, getRecentMemoryCommits } from "./git.ts";
 import { formatIntentCard, readIntentStore } from "./intents.ts";
 import { atomicWriteFileSync } from "./lock.ts";
+import { LEDGER_KINDS, ledgerLabel, listActive, rowSummary, type LedgerKind } from "./ledger.ts";
 import { parseSectionedMarkdown, readHotMemoryView } from "./markdown.ts";
-import { listActivePitfalls, type PitfallRow } from "./pitfalls.ts";
 
 export interface ClueMeta {
 	lastDreamAt?: string | null;
@@ -24,7 +23,7 @@ export interface DuplicateCandidate {
 }
 
 export interface EvidenceCheckItem {
-	kind: "pitfall" | "decision";
+	kind: LedgerKind;
 	id: number;
 	project: string;
 	summary: string;
@@ -34,12 +33,14 @@ export interface EvidenceCheckItem {
 }
 
 export interface ColdMemoryItem {
-	kind: "pitfall" | "decision";
+	kind: LedgerKind;
 	id: number;
 	project: string;
 	summary: string;
+	/** Days since the row was last written or explicitly confirmed (verify). */
 	ageDays: number;
-	hitCount: number;
+	/** Days since a model last looked it up explicitly, or null if never. */
+	daysSinceHit: number | null;
 }
 
 export interface MemoryHealthReport {
@@ -55,10 +56,8 @@ export interface MemoryHealthReport {
 		globalPct: number;
 		maxProjectPct: number;
 		maxProjectHeading: string | null;
-		activePitfalls: number;
-		pitfallsWithoutEvidence: number;
-		activeDecisions: number;
-		decisionsWithoutEvidence: number;
+		active: Record<LedgerKind, number>;
+		withoutEvidence: number;
 		totalHits: number;
 		staleEvidenceCount: number;
 		daysSinceDream: number | null;
@@ -235,45 +234,33 @@ export function evaluateMemoryHealth(
 		}
 	}
 
-	const pitfalls: PitfallRow[] = listActivePitfalls(paths.dbPath);
-	const decisions: DecisionRow[] = listActiveDecisions(paths.dbPath);
-	const pitfallsWithoutEvidence = pitfalls.filter(p => !p.evidence?.trim()).length;
-	const decisionsWithoutEvidence = decisions.filter(d => !d.evidence?.trim()).length;
-	const totalHits =
-		pitfalls.reduce((acc, p) => acc + (p.hit_count || 0), 0) +
-		decisions.reduce((acc, d) => acc + (d.hit_count || 0), 0);
+	const ledgers = LEDGER_KINDS.map(kind => ({ kind, rows: listActive(paths, kind) }));
+	const active = Object.fromEntries(ledgers.map(l => [l.kind, l.rows.length])) as Record<LedgerKind, number>;
+	const withoutEvidence = ledgers.reduce((n, l) => n + l.rows.filter(r => !r.evidence).length, 0);
+	const totalHits = ledgers.reduce((n, l) => n + l.rows.reduce((m, r) => m + r.hit_count, 0), 0);
 
 	const evidenceChecks: EvidenceCheckItem[] = [];
 	const coldItems: ColdMemoryItem[] = [];
 	const nowMs = Date.now();
+	const daysAgo = (iso: string) => Math.max(0, Math.floor((nowMs - new Date(iso).getTime()) / 86_400_000));
 
-	const inspectItem = (
-		kind: "pitfall" | "decision",
-		id: number,
-		project: string,
-		summary: string,
-		evidence: string,
-		updatedAt: string,
-		hitCount: number,
-	) => {
-		const isCurrentOrGlobal = !projectKey || project === "global" || project === projectKey.toLowerCase();
-		if (cwd && evidence.trim() && isCurrentOrGlobal) {
-			const res = verifyEvidenceAnchor(evidence, cwd);
-			if (res.status === "stale-file-missing" || res.status === "stale-file-changed") {
-				evidenceChecks.push({ kind, id, project, summary, evidence, status: res.status, detail: res.detail });
+	for (const { kind, rows } of ledgers) {
+		for (const r of rows) {
+			const summary = rowSummary(kind, r);
+			const isCurrentOrGlobal = !projectKey || r.project === "global" || r.project === projectKey.toLowerCase();
+			if (cwd && r.evidence && isCurrentOrGlobal) {
+				const res = verifyEvidenceAnchor(r.evidence, cwd);
+				if (res.status === "stale-file-missing" || res.status === "stale-file-changed") {
+					evidenceChecks.push({ kind, id: r.id, project: r.project, summary, evidence: r.evidence, status: res.status, detail: res.detail });
+				}
+			}
+			// Cold = nobody confirmed it AND nobody looked it up for `coldDays`. Flashback shows never count.
+			const ageDays = daysAgo(r.verified_at > r.updated_at ? r.verified_at : r.updated_at);
+			const daysSinceHit = r.last_hit_at ? daysAgo(r.last_hit_at) : null;
+			if (ageDays >= config.limits.coldDays && (daysSinceHit === null || daysSinceHit >= config.limits.coldDays)) {
+				coldItems.push({ kind, id: r.id, project: r.project, summary, ageDays, daysSinceHit });
 			}
 		}
-		const ageDays = Math.max(0, Math.floor((nowMs - new Date(updatedAt).getTime()) / (86400 * 1000)));
-		if (hitCount === 0 && ageDays >= 60) {
-			coldItems.push({ kind, id, project, summary, ageDays, hitCount });
-		}
-	};
-
-	for (const p of pitfalls) {
-		inspectItem("pitfall", p.id, p.project, p.symptom, p.evidence, p.updated_at, p.hit_count || 0);
-	}
-	for (const d of decisions) {
-		inspectItem("decision", d.id, d.project, d.decision, d.evidence, d.updated_at, d.hit_count || 0);
 	}
 
 	const meta = readClueMeta(paths);
@@ -310,6 +297,9 @@ export function evaluateMemoryHealth(
 	if (evidenceChecks.length > 0) {
 		reasons.push(`检测到 ${evidenceChecks.length} 条记忆溯源疑似过期`);
 	}
+	if (coldItems.length > 0) {
+		reasons.push(`${coldItems.length} 条记忆超过 ${config.limits.coldDays} 天没确认也没被查过`);
+	}
 
 	const status = reasons.length > 0 ? "attention" : "healthy";
 	const hint =
@@ -330,10 +320,8 @@ export function evaluateMemoryHealth(
 			globalPct,
 			maxProjectPct,
 			maxProjectHeading,
-			activePitfalls: pitfalls.length,
-			pitfallsWithoutEvidence,
-			activeDecisions: decisions.length,
-			decisionsWithoutEvidence,
+			active,
+			withoutEvidence,
 			totalHits,
 			staleEvidenceCount: evidenceChecks.length,
 			daysSinceDream,
@@ -354,8 +342,7 @@ export function buildDreamPacket(
 	const health = evaluateMemoryHealth(config, paths, projectKey, cwd);
 	const view = readHotMemoryView(config, paths, projectKey);
 	const intentStore = readIntentStore(paths.intentsPath);
-	const pitfalls = listActivePitfalls(paths.dbPath);
-	const decisions = listActiveDecisions(paths.dbPath);
+	const ledgers = LEDGER_KINDS.map(kind => ({ kind, rows: listActive(paths, kind) }));
 	const recentCommits = getRecentMemoryCommits(paths.home, 12);
 
 	const intentKeys = Object.keys(intentStore).sort();
@@ -363,7 +350,7 @@ export function buildDreamPacket(
 		"=== CLUE DREAM（记忆健康体检与防腐烂整理材料）===",
 		`状态: ${health.status === "healthy" ? "健康" : "建议整理"}`,
 		...(health.reasons.length > 0 ? [`触发信号: ${health.reasons.join("；")}`] : ["触发信号: 无明显超标（可做常规瘦身与纠错）"]),
-		`指标: PROFILE ${health.metrics.profileChars}/${health.metrics.profileLimit} (${health.metrics.profilePct}%) | 意图卡 ${intentKeys.length} 个 | 活跃决定 ${health.metrics.activeDecisions} 条 | 活跃踩坑 ${health.metrics.activePitfalls} 条 | 累计自动闪回 ${health.metrics.totalHits} 次 | 疑似过期溯源 ${health.metrics.staleEvidenceCount} 条`,
+		`指标: PROFILE ${health.metrics.profileChars}/${health.metrics.profileLimit} (${health.metrics.profilePct}%) | 意图卡 ${intentKeys.length} 个 | ${LEDGER_KINDS.map(k => `${ledgerLabel(k)} ${health.metrics.active[k]} 条`).join(" | ")} | 主动查阅 ${health.metrics.totalHits} 次 | 疑似过期溯源 ${health.metrics.staleEvidenceCount} 条`,
 		"",
 		view.formatted,
 		"",
@@ -371,22 +358,16 @@ export function buildDreamPacket(
 		...(intentKeys.length > 0
 			? intentKeys.map(k => `[${k} · 更新 ${intentStore[k]!.updatedAt.slice(0, 10)}]\n${formatIntentCard(intentStore[k]!)}`)
 			: ["(暂无)"]),
-		"",
-		"=== 活跃关键决定清单 ===",
-		...(decisions.length > 0
-			? decisions.map(
-					d =>
-						`- #${d.id} [${d.project}] 决定: ${d.decision} | 原因: ${d.rationale}${d.revisit_when ? ` | 推翻条件: ${d.revisit_when}` : ""} | 命中 ${d.hit_count || 0} 次${d.evidence ? ` | 溯源: ${d.evidence}` : " | (无溯源)"}`,
-				)
-			: ["(暂无)"]),
-		"",
-		"=== 活跃踩坑清单 ===",
-		...(pitfalls.length > 0
-			? pitfalls.map(
-					p =>
-						`- #${p.id} [${p.project}] 现象: ${p.symptom} | 根因: ${p.root_cause} | 命中 ${p.hit_count || 0} 次${p.evidence ? ` | 溯源: ${p.evidence}` : " | (无溯源)"}`,
-				)
-			: ["(暂无)"]),
+		...ledgers.flatMap(({ kind, rows }) => [
+			"",
+			`=== 活跃${ledgerLabel(kind)}清单 ===`,
+			...(rows.length > 0
+				? rows.map(
+						r =>
+							`- #${r.id} [${r.project}] ${rowSummary(kind, r)} | 最近确认 ${(r.verified_at || r.updated_at).slice(0, 10)} | 查阅 ${r.hit_count} 次${r.evidence ? ` | 溯源: ${r.evidence}` : " | (无溯源)"}`,
+					)
+				: ["(暂无)"]),
+		]),
 	];
 
 	if (health.metrics.evidenceChecks.length > 0) {
@@ -402,9 +383,10 @@ export function buildDreamPacket(
 	if (health.metrics.coldItems.length > 0) {
 		lines.push(
 			"",
-			"=== 长期 0 命中冷门条目（>=60 天未命中） ===",
+			`=== 冷门条目（≥${config.limits.coldDays} 天没确认、也没被查过） ===`,
 			...health.metrics.coldItems.map(
-				c => `- [${c.kind} #${c.id} | ${c.project}] ${c.summary}（已存放 ${c.ageDays} 天，0 命中）`,
+				c =>
+					`- [${c.kind} #${c.id} | ${c.project}] ${c.summary}（${c.ageDays} 天未确认，${c.daysSinceHit === null ? "从未被查过" : `${c.daysSinceHit} 天前被查过`}）`,
 			),
 		);
 	}
@@ -426,8 +408,8 @@ export function buildDreamPacket(
 	lines.push(
 		"",
 		"【做梦整理输出要求】",
-		"1. 重点检查四件事：(a) 有无溯源失效、过时或互相冲突的条目；(b) 有无把静态工作纪律误放进 PROFILE.md 的条目；(c) 项目 4 格意图卡是否与最新代码现状一致；(d) 长期 0 命中的条目是否值得精简或淘汰。",
-		"2. 修改个人名片或删除旧记录前，先向用户输出清晰编号的「整理提案草稿」（含前后对比），等用户批复后再落盘并运行 `clue dream --mark-done`。",
+		"1. 重点检查：(a) 溯源失效、过时或互相冲突的条目；(b) 误放进 PROFILE.md 的静态工作规则（规则属于 AGENTS.md）；(c) 意图卡是否与代码现状一致；(d) 冷门条目：仍成立就提 verify 草稿，已过时就提 delete/supersede 草稿；(e) 能合并的重复条目。",
+		"2. 所有改动都用 clue 起草进待确认草稿箱，把完整草稿清单（编号 + 前后对比）给用户看，用户确认后 `clue apply`，最后运行 `clue dream --mark-done`。",
 	);
 
 	return lines.join("\n");

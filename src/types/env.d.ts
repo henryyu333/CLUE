@@ -25,6 +25,8 @@ declare module "bun:test" {
 		toBeTruthy(): void;
 		toBeFalsy(): void;
 		toBeNull(): void;
+		toBeUndefined(): void;
+		toHaveLength(expected: number): void;
 		toContain(expected: unknown): void;
 		toBeGreaterThan(expected: number): void;
 		toBeGreaterThanOrEqual(expected: number): void;
@@ -71,7 +73,7 @@ declare module "node:child_process" {
 	export function execFileSync(
 		file: string,
 		args?: readonly string[],
-		options?: { encoding?: "utf8"; stdio?: unknown; cwd?: string },
+		options?: { encoding?: "utf8"; stdio?: unknown; cwd?: string; input?: string; timeout?: number; env?: Record<string, string | undefined> },
 	): string;
 }
 
@@ -104,6 +106,7 @@ declare module "node:fs" {
 	export function renameSync(oldPath: string, newPath: string): void;
 	export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
 	export function statSync(path: string): Stats;
+	export function lstatSync(path: string): Stats & { isSymbolicLink(): boolean };
 	export function chmodSync(path: string, mode: number): void;
 	export function readdirSync(path: string, options: { withFileTypes: true }): Dirent[];
 	export function readdirSync(path: string): string[];
@@ -120,4 +123,5 @@ declare module "node:path" {
 	export function dirname(p: string): string;
 	export function join(...paths: string[]): string;
 	export function resolve(...paths: string[]): string;
+	export function isAbsolute(p: string): boolean;
 }

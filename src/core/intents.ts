@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import type { ClueConfig, CluePaths } from "./config.ts";
-import { commitMemoryGit } from "./git.ts";
+import type { ClueConfig, CluePaths, IntentSlot } from "./config.ts";
 import { atomicWriteFileSync, withMemoryLock } from "./lock.ts";
 import { charCount } from "./markdown.ts";
 import { scanMemoryContent } from "./security.ts";
@@ -33,7 +32,6 @@ export interface IntentMutationResult {
 	ok: boolean;
 	message: string;
 	card?: ProjectIntentCard | null;
-	commit?: string | null;
 	changes?: string[];
 }
 
@@ -91,6 +89,7 @@ export function mutateProjectIntent(
 	paths: CluePaths,
 	req: IntentMutationRequest,
 	defaultProject: string | null,
+	skipSlots: readonly IntentSlot[] = [],
 ): IntentMutationResult {
 	const proj = (req.project?.trim().toLowerCase() || defaultProject?.trim().toLowerCase() || "").replace(/^project:\s*/, "");
 	const op = req.op ?? "set";
@@ -125,21 +124,12 @@ export function mutateProjectIntent(
 		const prev = store[proj] ?? null;
 
 		if (op === "clear") {
-			if (!prev) {
-				return { ok: true, card: null, message: `项目 [${proj}] 本就没有意图卡，无需清空。` };
-			}
+			if (!prev) return { ok: false, card: null, message: `项目 [${proj}] 本就没有意图卡，无需清空。` };
+			const changes = [`清空 [${proj}] 意图卡`];
+			if (req.dryRun) return { ok: true, card: null, changes, message: `将清空项目 [${proj}] 意图卡。` };
 			delete store[proj];
-			if (req.dryRun) {
-				return { ok: true, card: null, message: `[DRY-RUN] 将清空项目 [${proj}] 意图卡。` };
-			}
 			atomicWriteFileSync(paths.intentsPath, `${JSON.stringify(store, null, 2)}\n`, { readOnly: config.readOnlyGuard });
-			const sha = commitMemoryGit(paths.home, `intent: clear ${proj}`);
-			return {
-				ok: true,
-				card: null,
-				commit: sha,
-				message: `已清空项目 [${proj}] 意图卡${sha ? ` (commit ${sha})` : ""}。`,
-			};
+			return { ok: true, card: null, changes, message: `已清空项目 [${proj}] 意图卡。` };
 		}
 
 		const next: ProjectIntentCard = {
@@ -156,6 +146,12 @@ export function mutateProjectIntent(
 		const slotKeys: Array<"goal" | "approach" | "nonGoals" | "checkpoint"> = ["goal", "approach", "nonGoals", "checkpoint"];
 		for (const key of slotKeys) {
 			if (req[key] === undefined) continue;
+			if (skipSlots.includes(key) && req[key]!.trim()) {
+				return {
+					ok: false,
+					message: `项目 [${proj}] 的「${SLOT_LABELS[key]}」由项目自己的交班文件维护，clue 不写这一格（可传空字符串清空旧值）。`,
+				};
+			}
 			const cleaned = cleanSlot(req[key]!);
 			if (!cleaned.ok) return { ok: false, message: `${SLOT_LABELS[key]}校验失败：${cleaned.err}` };
 			if (cleaned.text !== next[key]) {
@@ -188,34 +184,16 @@ export function mutateProjectIntent(
 		}
 
 		if (changes.length === 0 && prev) {
-			return {
-				ok: true,
-				card: prev,
-				changes: [],
-				message: `项目 [${proj}] 意图卡无实质变动。`,
-			};
+			return { ok: false, card: prev, changes: [], message: `项目 [${proj}] 意图卡无实质变动。` };
 		}
 
+		const sizeLine = `(${totalChars}/${config.limits.intentCardChars} 字)`;
 		if (req.dryRun) {
-			return {
-				ok: true,
-				card: next,
-				changes,
-				message: `[DRY-RUN] 项目 [${proj}] 意图卡预检通过 (${totalChars}/${config.limits.intentCardChars} 字)\n${changes.map(c => `- ${c}`).join("\n")}`,
-			};
+			return { ok: true, card: next, changes, message: `项目 [${proj}] 意图卡预检通过 ${sizeLine}` };
 		}
 
 		store[proj] = next;
 		atomicWriteFileSync(paths.intentsPath, `${JSON.stringify(store, null, 2)}\n`, { readOnly: config.readOnlyGuard });
-		const sha = commitMemoryGit(paths.home, `intent(${proj}): ${req.reason?.trim() || "update intent card"}`);
-		return {
-			ok: true,
-			card: next,
-			commit: sha,
-			changes,
-			message:
-				`已刷新 [${proj}] 项目意图卡 (${totalChars}/${config.limits.intentCardChars} 字)${sha ? ` (commit ${sha})` : ""}\n` +
-				changes.map(c => `- ${c}`).join("\n"),
-		};
+		return { ok: true, card: next, changes, message: `已刷新 [${proj}] 项目意图卡 ${sizeLine}` };
 	});
 }

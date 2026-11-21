@@ -320,6 +320,35 @@ export function indexRecallSessions(
 	});
 }
 
+/**
+ * Incremental refresh used on session boot so continuity anchors and liveness checks see recent
+ * sessions. Skipped when the index has never been built (first build is an explicit `clue index`)
+ * or was refreshed within `maxAgeMs`; never throws.
+ */
+export function refreshRecallIfStale(
+	dbPath: string,
+	options: { lockPath: string; worktreeSuffixes?: readonly string[]; workspaceRoots?: readonly string[]; maxAgeMs?: number },
+): void {
+	if (!existsSync(dbPath)) return;
+	try {
+		const db = openRecallDb(dbPath);
+		let last = "";
+		try {
+			last = (db.query("SELECT MAX(indexed_at) AS t FROM index_sources").get() as { t: string | null } | null)?.t ?? "";
+		} finally {
+			db.close();
+		}
+		if (last && Date.now() - Date.parse(last) < (options.maxAgeMs ?? 5 * 60 * 1000)) return;
+		indexRecallSessions(dbPath, {
+			lockPath: options.lockPath,
+			worktreeSuffixes: options.worktreeSuffixes,
+			workspaceRoots: options.workspaceRoots,
+		});
+	} catch {
+		// A busy or locked index just means stale anchors this time.
+	}
+}
+
 export function getRecallSources(dbPath: string): Array<{
 	harness: string;
 	sessions: number;

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { DEFAULT_WORKSPACE_ROOTS, DEFAULT_WORKTREE_SUFFIXES } from "../core/config.ts";
 import { redactSecrets } from "../core/security.ts";
 
@@ -108,7 +108,37 @@ export function deriveProjectFromPath(
 	}
 	const suffixRe = buildWorktreeSuffixRegex(worktreeSuffixes);
 	const m = lower.match(suffixRe);
-	return m ? m[1]! : lower;
+	if (m) return m[1]!;
+	// Ad-hoc worktrees like `Rakko-hermes` or `Rakko-issue6` next to the primary `Rakko` checkout.
+	const dash = seg.indexOf("-");
+	if (dash > 0 && isAbsolute(raw) && existsSync(join(dirname(raw.replace(/[/\\]+$/, "")), seg.slice(0, dash)))) {
+		return seg.slice(0, dash).toLowerCase();
+	}
+	return lower;
+}
+
+/**
+ * AGY transcripts carry no cwd. Infer the project from the workspace path the conversation mentions
+ * most (at least 3 times), e.g. `/Users/me/workspace/clue/src/...` → `clue`.
+ */
+function inferProjectFromMentions(
+	messages: readonly ParsedMessage[],
+	worktreeSuffixes: readonly string[] | undefined,
+	workspaceRoots: readonly string[] = DEFAULT_WORKSPACE_ROOTS,
+): string {
+	const rootAlt = workspaceRoots.map(r => r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+	const re = new RegExp(`(?:/Users|/home)/[^/\\s]+/(?:${rootAlt})/[^/\\s"'\`)<>]+`, "g");
+	const counts = new Map<string, number>();
+	for (const msg of messages) {
+		for (const m of msg.content.matchAll(re)) counts.set(m[0], (counts.get(m[0]) ?? 0) + 1);
+	}
+	const byProject = new Map<string, number>();
+	for (const [path, n] of counts) {
+		const key = deriveProjectFromPath(path, worktreeSuffixes, workspaceRoots);
+		byProject.set(key, (byProject.get(key) ?? 0) + n);
+	}
+	const [best, n] = [...byProject].sort((a, b) => b[1] - a[1])[0] ?? ["global", 0];
+	return n >= 3 ? best : "global";
 }
 
 function extractTextFromContent(content: unknown): string {
@@ -359,10 +389,8 @@ export function parseFileSession(
 		id: sessionId,
 		harness: file.harness,
 		project:
-			file.harness === "agy"
-				? cwd
-					? deriveProjectFromPath(cwd, opts?.worktreeSuffixes, opts?.workspaceRoots)
-					: "global"
+			file.harness === "agy" && !cwd
+				? inferProjectFromMentions(messages, opts?.worktreeSuffixes, opts?.workspaceRoots)
 				: deriveProjectFromPath(cwd || basename(join(file.path, "..")), opts?.worktreeSuffixes, opts?.workspaceRoots),
 		cwd,
 		title: title || basename(file.path),

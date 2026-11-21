@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { DEFAULT_WORKSPACE_ROOTS } from "./config.ts";
+import { DEFAULT_WORKSPACE_ROOTS, type ClueConfig, type IntentSlot, type ProjectWorkflowRule } from "./config.ts";
 
 /**
  * Resolve a stable lowercase project key from cwd.
@@ -72,4 +72,23 @@ export function detectProjectFile(cwd: string, relativeFile: string): { file: st
 		// ignore
 	}
 	return null;
+}
+
+export interface MatchedWorkflow {
+	wf: ProjectWorkflowRule;
+	hit: { file: string; dir: string };
+}
+
+export function matchProjectWorkflows(config: ClueConfig, cwd: string): MatchedWorkflow[] {
+	const out: MatchedWorkflow[] = [];
+	for (const wf of config.projectWorkflows) {
+		const hit = detectProjectFile(cwd, wf.detectFile);
+		if (hit) out.push({ wf, hit });
+	}
+	return out;
+}
+
+/** Intent-card slots owned by a matching project workflow (e.g. a handoff file keeps the current checkpoint). */
+export function skippedIntentSlots(config: ClueConfig, cwd: string): IntentSlot[] {
+	return [...new Set(matchProjectWorkflows(config, cwd).flatMap(m => m.wf.intentSkipSlots ?? []))];
 }

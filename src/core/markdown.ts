@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
 import type { ClueConfig, CluePaths } from "./config.ts";
-import { commitMemoryGit } from "./git.ts";
 import { atomicWriteFileSync, withMemoryLock } from "./lock.ts";
 import { scanMemoryContent } from "./security.ts";
 
@@ -28,7 +27,7 @@ export interface CurateRequest {
 export interface CurateResult {
 	ok: boolean;
 	message: string;
-	commit?: string | null;
+	changes?: string[];
 	details?: Record<string, unknown>;
 }
 
@@ -304,19 +303,17 @@ export function curateHotMemory(
 			if (req.dryRun) {
 				return {
 					ok: true,
-					message: `[DRY-RUN] PROFILE.md 预检通过 [${nextChars}/${config.limits.profileChars} 字 (${pct}%), 净变动 ${deltaStr} 字]\n${appliedDiff.join("\n") || "无实质条目变动"}`,
+					message: `PROFILE.md 预检通过 [${nextChars}/${config.limits.profileChars} 字 (${pct}%), 净变动 ${deltaStr} 字]`,
+					changes: appliedDiff,
 					details: { dryRun: true, chars: nextChars, delta, limit: config.limits.profileChars },
 				};
 			}
 			atomicWriteFileSync(paths.profilePath, nextText, { readOnly: config.readOnlyGuard });
-			const sha = commitMemoryGit(paths.home, `profile: ${req.reason?.trim() || "curate entries"}`);
 			return {
 				ok: true,
-				commit: sha,
-				message:
-					`PROFILE.md 已更新 [${nextChars}/${config.limits.profileChars} 字 (${pct}%), 净变动 ${deltaStr} 字]${sha ? ` (commit ${sha})` : ""}\n` +
-					(appliedDiff.join("\n") || "无实质条目变动"),
-				details: { chars: nextChars, delta, limit: config.limits.profileChars, commit: sha },
+				message: `PROFILE.md 已更新 [${nextChars}/${config.limits.profileChars} 字 (${pct}%), 净变动 ${deltaStr} 字]`,
+				changes: appliedDiff,
+				details: { chars: nextChars, delta, limit: config.limits.profileChars },
 			};
 		}
 
@@ -341,24 +338,11 @@ export function curateHotMemory(
 
 		const nextProjects = serializeProjects(map, config.globalProjectHeading);
 		const scopedAfter = renderScopedProjectsView(nextProjects, projectKey, config.globalProjectHeading);
+		const sizeLine = `[全局 ${scopedAfter.globalChars}/${config.limits.globalProjectChars} 字 | 当前项目 ${scopedAfter.projectChars}/${config.limits.singleProjectChars} 字]`;
 		if (req.dryRun) {
-			return {
-				ok: true,
-				message:
-					`[DRY-RUN] PROJECTS.md 预检通过 [全局 ${scopedAfter.globalChars}/${config.limits.globalProjectChars} 字 | 当前项目 ${scopedAfter.projectChars}/${config.limits.singleProjectChars} 字]\n` +
-					(appliedDiff.join("\n") || "无实质条目变动"),
-				details: { dryRun: true },
-			};
+			return { ok: true, message: `PROJECTS.md 预检通过 ${sizeLine}`, changes: appliedDiff, details: { dryRun: true } };
 		}
 		atomicWriteFileSync(paths.projectsPath, nextProjects, { readOnly: config.readOnlyGuard });
-		const sha = commitMemoryGit(paths.home, `projects: ${req.reason?.trim() || "curate entries"}`);
-		return {
-			ok: true,
-			commit: sha,
-			message:
-				`PROJECTS.md 已更新 [全局 ${scopedAfter.globalChars}/${config.limits.globalProjectChars} 字 | 当前项目 ${scopedAfter.projectChars}/${config.limits.singleProjectChars} 字]${sha ? ` (commit ${sha})` : ""}\n` +
-				(appliedDiff.join("\n") || "无实质条目变动"),
-			details: { commit: sha },
-		};
+		return { ok: true, message: `PROJECTS.md 已更新 ${sizeLine}`, changes: appliedDiff, details: {} };
 	});
 }

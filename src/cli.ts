@@ -4,45 +4,55 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	acceptManualEdits,
+	addDraft,
+	applyDrafts,
 	buildBootSnapshot,
 	buildDreamPacket,
 	buildProactiveFlashback,
 	buildTurnNotice,
 	buildWebExportBundle,
-	checkRawEditGuard,
-	curateHotMemory,
+	detectInvoker,
 	detectUnauthorizedChanges,
+	dropDrafts,
 	ensureClueStorage,
 	evaluateMemoryHealth,
 	formatAgyPreInvocation,
 	formatAgySessionStart,
 	formatClaudeHookOutput,
 	formatDecisionGuidance,
+	formatDraftList,
 	formatIntentCard,
+	formatNoteGuidance,
 	formatPitfallGuidance,
 	getProjectIntent,
 	getReadOnlyGuardedFiles,
 	getRecentMemoryCommits,
-	listActiveDecisions,
-	listActivePitfalls,
+	isWorkerRole,
+	LEDGER_KINDS,
+	ledgerFile,
+	ledgerLabel,
+	listActive,
 	loadClueConfig,
 	lockFilesReadOnly,
+	lookedUpSince,
 	markDreamDone,
-	mutateDecision,
-	mutatePitfall,
 	mutateProjectIntent,
-	openDecisionDb,
-	openPitfallDb,
+	noteHarnessSeen,
+	readDrafts,
 	readHotMemoryView,
+	readLedger,
+	recordHits,
 	resolveProjectKey,
-	searchDecisions,
-	searchPitfalls,
+	restoreTruthFiles,
+	searchLedger,
+	skippedIntentSlots,
 	undoLastMemoryCommit,
 	unlockFilesWritable,
-	type CurateRequest,
-	type DecisionMutationRequest,
-	type IntentMutationRequest,
-	type PitfallMutationRequest,
+	type DecisionRow,
+	type DraftKind,
+	type NoteRow,
+	type PitfallRow,
 } from "./core/index.ts";
 import {
 	getRecallSources,
@@ -51,9 +61,9 @@ import {
 	showSessionWindow,
 	type RecallHarness,
 } from "./recall/index.ts";
-import { inspectHarnessAdapters, installHarnessAdapter, type InstallTarget } from "./adapters/install.ts";
+import { ADAPTER_TARGETS, inspectHarnessAdapters, installHarnessAdapter, type InstallTarget } from "./adapters/install.ts";
 
-const VERSION = "0.5.1";
+const VERSION = "0.6.0";
 
 function parseArgs(argv: string[]): { positionals: string[]; flags: Record<string, string | boolean> } {
 	const positionals: string[] = [];
@@ -99,100 +109,77 @@ function getFlagBool(flags: Record<string, string | boolean>, key: string): bool
 	return flags[key] === true || flags[key] === "true";
 }
 
-const DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
+function fail(message: string): never {
+	console.error(message);
+	process.exit(1);
+}
 
-function cleanupStaleDedupFiles(dir: string): void {
+// ---------------------------------------------------------------------------
+// Per-conversation scratch state for CLI-hook harnesses (one process per hook call).
+
+const HOOK_STATE_DIR = join(tmpdir(), "clue-hook-dedup");
+const HOOK_STATE_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+
+function hookStateFile(prefix: string, scopeKey: string): string {
+	mkdirSync(HOOK_STATE_DIR, { recursive: true });
+	return join(HOOK_STATE_DIR, `${prefix}-${createHash("sha1").update(scopeKey).digest("hex").slice(0, 16)}.json`);
+}
+
+function readHookState<T>(prefix: string, scopeKey: string): T | null {
 	try {
-		const now = Date.now();
-		for (const name of readdirSync(dir)) {
-			if (!name.endsWith(".json")) continue;
-			const full = join(dir, name);
-			try {
-				const st = statSync(full);
-				if (now - st.mtimeMs > DEDUP_TTL_MS) {
-					rmSync(full, { force: true });
-				}
-			} catch {
-				// ignore individual file errors
+		const file = hookStateFile(prefix, scopeKey);
+		return existsSync(file) ? (JSON.parse(readFileSync(file, "utf8")) as T) : null;
+	} catch {
+		return null;
+	}
+}
+
+function writeHookState(prefix: string, scopeKey: string, value: unknown): void {
+	try {
+		writeFileSync(hookStateFile(prefix, scopeKey), JSON.stringify(value), "utf8");
+		if (Math.random() < 0.05) {
+			const now = Date.now();
+			for (const name of readdirSync(HOOK_STATE_DIR)) {
+				const full = join(HOOK_STATE_DIR, name);
+				if (now - statSync(full).mtimeMs > HOOK_STATE_TTL_MS) rmSync(full, { force: true });
 			}
 		}
 	} catch {
-		// ignore
-	}
-}
-
-function wasHookTurnSeen(scopeKey: string, turnFingerprint: string): boolean {
-	try {
-		const dir = join(tmpdir(), "clue-hook-dedup");
-		mkdirSync(dir, { recursive: true });
-		if (Math.random() < 0.05) {
-			cleanupStaleDedupFiles(dir);
-		}
-		const file = join(dir, `${createHash("sha1").update(scopeKey).digest("hex").slice(0, 16)}.json`);
-		if (existsSync(file)) {
-			const prev = JSON.parse(readFileSync(file, "utf8")) as { fp?: string };
-			if (prev.fp === turnFingerprint) return true;
-		}
-		writeFileSync(file, JSON.stringify({ fp: turnFingerprint, ts: Date.now() }), "utf8");
-	} catch {
-		// Never fail hook execution because of temp dir issues
-	}
-	return false;
-}
-
-function readShownFlashbackKeys(scopeKey: string): Set<string> {
-	try {
-		const dir = join(tmpdir(), "clue-hook-dedup");
-		const file = join(dir, `fb-${createHash("sha1").update(scopeKey).digest("hex").slice(0, 16)}.json`);
-		if (existsSync(file)) {
-			const parsed = JSON.parse(readFileSync(file, "utf8")) as { keys?: string[] };
-			if (Array.isArray(parsed.keys)) return new Set(parsed.keys);
-		}
-	} catch {
-		// ignore
-	}
-	return new Set();
-}
-
-function saveShownFlashbackKeys(scopeKey: string, keys: ReadonlySet<string>): void {
-	try {
-		const dir = join(tmpdir(), "clue-hook-dedup");
-		mkdirSync(dir, { recursive: true });
-		const file = join(dir, `fb-${createHash("sha1").update(scopeKey).digest("hex").slice(0, 16)}.json`);
-		writeFileSync(file, JSON.stringify({ keys: [...keys].slice(-64), ts: Date.now() }), "utf8");
-	} catch {
-		// ignore
+		// Scratch state must never fail a hook.
 	}
 }
 
 function printHelp(): void {
-	console.log(`clue v${VERSION} — Local-first, bounded, anti-anchoring personal memory CLI
+	console.log(`clue v${VERSION} — local-first personal memory for AI coding agents
 
-Usage:
+Read:
   clue boot [--cwd <dir>] [--format text|agy|claude|json]
-  clue view [--cwd <dir>] [--json]
-  clue status [--cwd <dir>] [--json]
-  clue search [query] [--type all|pitfall|decision] [--project <key>] [--limit <1-10>] [--all] [--json]
-  clue intent [--project <key>] [--dry-run]      (view card, or stdin JSON to update 4 slots)
-  clue decision [--cwd <dir>]                    (reads JSON payload from stdin)
-  clue recall [query] [--harness <name>] [--project <key>] [--role user|assistant] [--since 30d] [--limit 8] [--no-refresh] [--json]
-  clue show <id-prefix> [--around <seq>] [--window 4] [--offset 0] [--limit 12] [--full] [--json]
-  clue index [--harness <name>] [--rebuild] [--quiet] [--json]
-  clue sources [--json]
-  clue curate [--dry-run] [--cwd <dir>]          (reads JSON payload from stdin)
-  clue pitfall [--cwd <dir>]                     (reads JSON payload from stdin)
-  clue dream [--cwd <dir>] [--mark-done] [--summary <text>] [--json]
-  clue export [--project <key>] [--json]
-  clue log [--limit <n>]
-  clue undo
-  clue lock / unlock
+  clue status | view | log [--limit n]
+  clue search "<说法1 | 说法2>" [--type all|pitfall|decision|note] [--project <key>] [--limit n] [--all]
+  clue intent [--project <key>]                 (no stdin: show card)
+  clue recall "<query>" [--harness <name>] [--since 30d] [--limit n] [--all]
+  clue show <id-prefix> [--around <seq>] [--window 4] [--full]
+  clue index [--harness <name>] [--rebuild] | clue sources
+  clue dream [--mark-done] | clue export [--project <key>]
+
+Draft (stdin JSON; nothing is written until apply):
+  clue note | pitfall | decision | intent | curate
+  clue drafts                                   list pending drafts
+  clue apply <ids|all>                          write confirmed drafts as one commit + receipt
+  clue drop <ids|all>                           discard drafts
+  clue wrap                                     print the wrap-up checklist with current drafts
+
+Repair:
+  clue undo                                     revert the last memory commit
+  clue restore | clue accept "<reason>"         discard / keep edits made outside clue
+  clue lock | clue unlock
   clue doctor [--adapters] [--json]
-  clue install <agy|claude|codex|hermes> [--bin <path>] [--dry-run]
-  clue hook <session-start|prompt|guard> --harness <agy|claude|codex|hermes> [--with-boot]
-  clue version
+  clue install <${ADAPTER_TARGETS.join("|")}|--all> [--bin <path>] [--dry-run]
+  clue hook <session-start|prompt> --harness <agy|claude|codex|hermes|opencode> [--with-boot]
 
 Environment:
-  CLUE_HOME    Path to memory data directory (default: ~/.clue)`);
+  CLUE_HOME    memory directory (default: ~/.clue)
+  CLUE_ROLE    "worker" makes this process read-only (no drafts or writes)`);
 }
 
 async function runHookCommand(sub: string, flags: Record<string, string | boolean>): Promise<void> {
@@ -203,135 +190,94 @@ async function runHookCommand(sub: string, flags: Record<string, string | boolea
 		try {
 			payload = JSON.parse(raw) as Record<string, unknown>;
 		} catch {
-			// Fall back cleanly to empty object
+			// empty payload
 		}
 	}
 
 	const config = loadClueConfig(getFlagStr(flags, "home"));
 	const paths = ensureClueStorage(config);
-
+	noteHarnessSeen(paths, harness);
 	const workspacePaths = Array.isArray(payload.workspacePaths) ? payload.workspacePaths : [];
-	const cwd =
-		String(
-			payload.cwd ??
-				workspacePaths[0] ??
-				getFlagStr(flags, "cwd") ??
-				process.cwd(),
-		) || process.cwd();
+	const cwd = String(payload.cwd ?? workspacePaths[0] ?? getFlagStr(flags, "cwd") ?? process.cwd()) || process.cwd();
 
 	if (sub === "session-start") {
 		const snap = buildBootSnapshot(config, paths, cwd);
-		if (harness === "agy") {
-			console.log(JSON.stringify(formatAgySessionStart(snap)));
-		} else {
-			console.log(JSON.stringify(formatClaudeHookOutput("SessionStart", snap.block)));
-		}
+		console.log(
+			JSON.stringify(harness === "agy" ? formatAgySessionStart(snap) : formatClaudeHookOutput("SessionStart", snap.block)),
+		);
 		return;
 	}
 
-	if (sub === "prompt") {
-		// In AGY, PreInvocation fires before EVERY model call in a turn; only trigger on first invocation of the turn
-		if (harness === "agy" && typeof payload.invocationNum === "number" && payload.invocationNum > 1) {
-			console.log("{}");
-			return;
-		}
+	if (sub !== "prompt") fail(`Unknown hook subcommand: ${sub}`);
 
-		const extra = (payload.extra && typeof payload.extra === "object" ? payload.extra : {}) as Record<string, unknown>;
-		const promptText = String(payload.lastUserInput ?? payload.prompt ?? payload.userPrompt ?? extra.user_message ?? "");
-		const convId = String(payload.conversationId ?? payload.session_id ?? payload.sessionId ?? "");
-		const initialNumSteps = String(payload.initialNumSteps ?? "");
+	// AGY fires PreInvocation before every model call in a turn; only the first one carries the user turn.
+	if (harness === "agy" && typeof payload.invocationNum === "number" && payload.invocationNum > 1) {
+		console.log("{}");
+		return;
+	}
+	const extra = (payload.extra && typeof payload.extra === "object" ? payload.extra : {}) as Record<string, unknown>;
+	const promptText = String(payload.lastUserInput ?? payload.prompt ?? payload.userPrompt ?? extra.user_message ?? "");
+	const convId = String(payload.conversationId ?? payload.session_id ?? payload.sessionId ?? "");
+	const scope = convId ? `${harness}:${convId}` : "";
 
-		const blocks: string[] = [];
+	const blocks: string[] = [];
+	let sessionStart = new Date().toISOString();
+	if (scope) {
+		const st = readHookState<{ ts: string }>("start", scope);
+		if (st?.ts) sessionStart = st.ts;
+		else writeHookState("start", scope, { ts: sessionStart });
+		// Harnesses without a SessionStart hook (Codex, Hermes, OpenCode) get the boot block on the first turn.
+		if (getFlagBool(flags, "with-boot") && !st?.ts) blocks.push(buildBootSnapshot(config, paths, cwd).block);
+	}
 
-		// Optional first-turn boot injection for harnesses without a dedicated SessionStart hook (e.g. Codex, Hermes)
-		if (getFlagBool(flags, "with-boot") && convId) {
-			const bootAlreadySent = wasHookTurnSeen(`boot:${harness}:${convId}`, "booted");
-			if (!bootAlreadySent) {
-				blocks.push(buildBootSnapshot(config, paths, cwd).block);
-			}
-		}
+	// AGY/Hermes may call the prompt hook repeatedly for the same user turn.
+	let duplicate = false;
+	if ((harness === "agy" || harness === "hermes") && scope && promptText.trim()) {
+		const fp = createHash("sha1").update(`${String(payload.initialNumSteps ?? "")}:${promptText}`).digest("hex");
+		duplicate = readHookState<{ fp: string }>("turn", scope)?.fp === fp;
+		if (!duplicate) writeHookState("turn", scope, { fp });
+	}
 
-		// Deduplicate the entire user turn across repeated PreInvocation callbacks within the same turn (e.g. after tool calls in AGY)
-		let isDuplicateTurnCallback = false;
-		if ((harness === "agy" || harness === "hermes") && convId && promptText.trim()) {
-			const fp = createHash("sha1").update(`${initialNumSteps}:${promptText}`).digest("hex");
-			isDuplicateTurnCallback = wasHookTurnSeen(`prompt:${harness}:${convId}`, fp);
-		}
-
-		if (!isDuplicateTurnCallback) {
-			const notice = buildTurnNotice(config, paths, promptText, cwd);
-			if (notice) {
-				blocks.push(notice);
-			} else if (config.autoRecall && promptText.trim()) {
-				// Pure-local (<15ms) high-confidence flashback for ordinary technical turns (deduplicated per session)
-				const projKey = resolveProjectKey(cwd, config.workspaceRoots);
-				const fbScope = convId ? `fb:${harness}:${convId}` : "";
-				const shown = fbScope ? readShownFlashbackKeys(fbScope) : new Set<string>();
-				const fb = buildProactiveFlashback(config, paths, promptText, projKey, shown, convId || undefined);
-				if (fb.notice) {
-					blocks.push(fb.notice);
-					if (fbScope) {
-						for (const item of fb.items) shown.add(item.key);
-						saveShownFlashbackKeys(fbScope, shown);
-					}
+	if (!duplicate) {
+		const shown = new Set(scope ? (readHookState<{ keys: string[] }>("fb", scope)?.keys ?? []) : []);
+		const notice = buildTurnNotice(config, paths, promptText, cwd, {
+			sessionRef: scope || undefined,
+			viewedKeys: [...shown, ...lookedUpSince(paths, sessionStart)],
+		});
+		if (notice) {
+			blocks.push(notice);
+		} else if (config.autoRecall && promptText.trim()) {
+			const fb = buildProactiveFlashback(
+				config,
+				paths,
+				promptText,
+				resolveProjectKey(cwd, config.workspaceRoots),
+				shown,
+				convId || undefined,
+			);
+			if (fb.notice) {
+				blocks.push(fb.notice);
+				if (scope) {
+					for (const item of fb.items) shown.add(item.key);
+					writeHookState("fb", scope, { keys: [...shown].slice(-64) });
 				}
 			}
 		}
-
-		const combined = blocks.length > 0 ? blocks.join("\n\n") : null;
-		if (harness === "agy") {
-			console.log(JSON.stringify(formatAgyPreInvocation(combined)));
-		} else if (harness === "hermes") {
-			console.log(JSON.stringify(combined ? { context: combined } : {}));
-		} else {
-			console.log(JSON.stringify(formatClaudeHookOutput("UserPromptSubmit", combined)));
-		}
-		return;
 	}
 
-	if (sub === "guard") {
-		const toolCall = (payload.toolCall ?? {}) as Record<string, unknown>;
-		const toolName = String(toolCall.name ?? payload.tool_name ?? payload.toolName ?? "");
-		const toolArgs = (toolCall.args ?? payload.tool_input ?? payload.toolInput ?? {}) as Record<string, unknown>;
-		const verdict = checkRawEditGuard(paths, toolName, toolArgs);
+	const combined = blocks.length > 0 ? blocks.join("\n\n") : null;
+	if (harness === "agy") console.log(JSON.stringify(formatAgyPreInvocation(combined)));
+	else if (harness === "hermes" || harness === "opencode") console.log(JSON.stringify(combined ? { context: combined } : {}));
+	else console.log(JSON.stringify(formatClaudeHookOutput("UserPromptSubmit", combined)));
+}
 
-		if (harness === "agy") {
-			if (verdict.blocked) {
-				console.log(JSON.stringify({ decision: "deny", reason: verdict.reason }));
-			} else {
-				console.log(JSON.stringify({ decision: "allow" }));
-			}
-			return;
-		}
-
-		if (harness === "hermes") {
-			if (verdict.blocked) {
-				console.log(JSON.stringify({ action: "block", message: verdict.reason }));
-			} else {
-				console.log("{}");
-			}
-			return;
-		}
-
-		// Claude Code / Codex PreToolUse contract
-		if (verdict.blocked) {
-			console.log(
-				JSON.stringify({
-					hookSpecificOutput: {
-						hookEventName: "PreToolUse",
-						permissionDecision: "deny",
-						permissionDecisionReason: verdict.reason,
-					},
-				}),
-			);
-		} else {
-			console.log("{}");
-		}
-		return;
+function parseJsonInput<T>(raw: string, usage: string): T {
+	if (!raw) fail(usage);
+	try {
+		return JSON.parse(raw) as T;
+	} catch (e) {
+		fail(`stdin JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
 	}
-
-	console.error(`Unknown hook subcommand: ${sub}`);
-	process.exit(1);
 }
 
 async function main(): Promise<void> {
@@ -346,28 +292,28 @@ async function main(): Promise<void> {
 		console.log(`clue ${VERSION}`);
 		return;
 	}
-
 	if (cmd === "hook") {
 		await runHookCommand(positionals[1] ?? "", flags);
 		return;
 	}
-
 	if (cmd === "install") {
-		const rawTarget = (positionals[1] ?? "").toLowerCase();
-		const validTargets: InstallTarget[] = ["agy", "claude", "codex", "hermes"];
-		if (!validTargets.includes(rawTarget as InstallTarget)) {
-			console.error(`Usage: clue install <${validTargets.join("|")}> [--bin <path>] [--dry-run]`);
-			process.exit(1);
+		const all = getFlagBool(flags, "all") || positionals[1] === "all";
+		const targets: InstallTarget[] = all
+			? inspectHarnessAdapters()
+					.filter(a => a.detected)
+					.map(a => a.harness)
+			: [positionals[1]?.toLowerCase() as InstallTarget];
+		if (targets.some(t => !ADAPTER_TARGETS.includes(t))) {
+			fail(`Usage: clue install <${ADAPTER_TARGETS.join("|")}|--all> [--bin <path>] [--dry-run]`);
 		}
-		const res = installHarnessAdapter({
-			target: rawTarget as InstallTarget,
-			clueBin: getFlagStr(flags, "bin"),
-			dryRun: getFlagBool(flags, "dry-run"),
-		});
-		const prefix = getFlagBool(flags, "dry-run") ? "[DRY-RUN] " : "";
-		console.log(`${prefix}✅ Installed clue adapter for ${res.target}:`);
-		for (const c of res.changes) console.log(`  - ${c}`);
-		for (const n of res.notes) console.log(`\n${n}`);
+		const dryRun = getFlagBool(flags, "dry-run");
+		for (const target of targets) {
+			const res = installHarnessAdapter({ target, clueBin: getFlagStr(flags, "bin"), dryRun });
+			console.log(`${dryRun ? "[DRY-RUN] " : ""}✅ ${res.target}:`);
+			for (const c of res.changes) console.log(`  - ${c}`);
+			for (const n of res.notes) console.log(`  ${n.replaceAll("\n", "\n  ")}`);
+		}
+		if (targets.length === 0) console.log("没有检测到已安装的 harness。");
 		return;
 	}
 
@@ -375,449 +321,374 @@ async function main(): Promise<void> {
 	const paths = ensureClueStorage(config);
 	const cwd = getFlagStr(flags, "cwd") ?? process.cwd();
 	const projectKey = getFlagStr(flags, "project")?.trim().toLowerCase() || resolveProjectKey(cwd, config.workspaceRoots);
+	const invoker = detectInvoker();
+	const json = getFlagBool(flags, "json");
 
-	if (cmd === "boot") {
-		const snap = buildBootSnapshot(config, paths, cwd);
-		const fmt = (getFlagStr(flags, "format") ?? "text").toLowerCase();
-		if (fmt === "agy") {
-			console.log(JSON.stringify(formatAgySessionStart(snap)));
-		} else if (fmt === "claude") {
-			console.log(JSON.stringify(formatClaudeHookOutput("SessionStart", snap.block)));
-		} else if (fmt === "json") {
-			console.log(JSON.stringify(snap, null, 2));
-		} else {
-			console.log(snap.block);
-		}
-		return;
-	}
-
-	if (cmd === "view") {
-		const view = readHotMemoryView(config, paths, projectKey);
-		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify({ projectKey, ...view }, null, 2));
-		} else {
-			console.log(view.formatted);
-		}
-		return;
-	}
-
-	if (cmd === "status") {
-		const view = readHotMemoryView(config, paths, projectKey);
-		const health = evaluateMemoryHealth(config, paths, projectKey);
-		const tampering = detectUnauthorizedChanges(paths.home);
-		const intentCard = getProjectIntent(paths.intentsPath, projectKey);
-		const allActivePitfalls = listActivePitfalls(paths.dbPath);
-		const allActiveDecisions = listActiveDecisions(paths.dbPath);
-		const pitfalls = searchPitfalls(paths.dbPath, positionals.slice(1).join(" "), projectKey, 5, false);
-		const decisions = searchDecisions(paths.dbPath, positionals.slice(1).join(" "), projectKey, 5, false);
-		const commits = getRecentMemoryCommits(paths.home, 4);
-		const totalHits =
-			allActivePitfalls.reduce((acc, p) => acc + (p.hit_count || 0), 0) +
-			allActiveDecisions.reduce((acc, d) => acc + (d.hit_count || 0), 0);
-		if (getFlagBool(flags, "json")) {
-			console.log(
-				JSON.stringify(
-					{
-						home: paths.home,
-						projectKey,
-						health,
-						tampering,
-						intentCard,
-						totalHits,
-						recentDecisions: decisions,
-						recentPitfalls: pitfalls,
-						commits,
-					},
-					null,
-					2,
-				),
-			);
-			return;
-		}
-		const m = health.metrics;
-		const projPct = Math.round((view.scoped.projectChars / config.limits.singleProjectChars) * 100);
-		const lines = [
-			`📚 clue 个人记忆状态（数据目录：${paths.home}）`,
-			...(tampering.dirty
-				? [`⚠️ 完整性警报：检测到绕过 clue 的未提交修改（${tampering.files.join(", ")}），请核对 git diff！`]
-				: []),
-			`- PROFILE.md：${m.profileChars} / ${m.profileLimit} 字 (${m.profilePct}%)`,
-			`- PROJECTS.md：全局 ${m.globalChars} / ${m.globalLimit} 字 (${m.globalPct}%) | 当前项目 (${projectKey ?? "无"}) ${view.scoped.projectChars} / ${config.limits.singleProjectChars} 字 (${projPct}%)`,
-			`- 项目 4 格意图卡 (${projectKey ?? "无"})：${intentCard ? `已建立（更新于 ${intentCard.updatedAt.slice(0, 16)}）` : "尚未建立"}`,
-			...(intentCard ? formatIntentCard(intentCard).split("\n").map(l => `  ${l}`) : []),
-			`- 活跃记忆：踩坑 ${allActivePitfalls.length} 条（缺溯源 ${m.pitfallsWithoutEvidence} 条） | 关键决定 ${allActiveDecisions.length} 条 | 累计自动闪回命中 ${totalHits} 次`,
-			`- 健康状态：${health.status === "healthy" ? "健康" : `需留意（${health.reasons.join("；")}）`}`,
-			`- 最近关键决定：`,
-			...(decisions.length > 0
-				? decisions.map(
-						d =>
-							`  • #${d.id} [${d.project}] ${d.decision}${d.hit_count > 0 ? ` (命中 ${d.hit_count} 次)` : ""}${d.evidence ? `（溯源: ${d.evidence}）` : ""}`,
-					)
-				: ["  • (暂无记录)"]),
-			`- 最近踩坑线索：`,
-			...(pitfalls.length > 0
-				? pitfalls.map(
-						p =>
-							`  • #${p.id} [${p.project}] ${p.symptom} → 根因：${p.root_cause}${p.hit_count > 0 ? ` (命中 ${p.hit_count} 次)` : ""}${p.evidence ? `（溯源: ${p.evidence}）` : ""}`,
-					)
-				: ["  • (暂无记录)"]),
-			`- 最近版本记录：`,
-			...(commits.length > 0 ? commits.map(c => `  ${c}`) : ["  (暂无提交)"]),
-		];
-		console.log(lines.join("\n"));
-		return;
-	}
-
-	if (cmd === "search") {
-		const query = positionals.slice(1).join(" ").trim();
-		const limRaw = Number.parseInt(getFlagStr(flags, "limit") ?? "4", 10);
-		const limit = Math.max(1, Math.min(10, Number.isFinite(limRaw) ? limRaw : 4));
-		const includeInactive = getFlagBool(flags, "all");
-		const searchType = (getFlagStr(flags, "type") ?? "all").toLowerCase();
-		const pitfallRows =
-			searchType === "decision" ? [] : searchPitfalls(paths.dbPath, query, projectKey, limit, includeInactive);
-		const decisionRows =
-			searchType === "pitfall" ? [] : searchDecisions(paths.dbPath, query, projectKey, limit, includeInactive);
-		if (getFlagBool(flags, "json")) {
-			console.log(
-				JSON.stringify(
-					{
-						query,
-						project: projectKey,
-						type: searchType,
-						pitfalls: pitfallRows,
-						decisions: decisionRows,
-						count: pitfallRows.length + decisionRows.length,
-						rows: pitfallRows,
-					},
-					null,
-					2,
-				),
-			);
-		} else {
-			const parts: string[] = [];
-			if (searchType !== "pitfall" && decisionRows.length > 0) {
-				parts.push(formatDecisionGuidance(decisionRows));
-			}
-			if (searchType !== "decision" && pitfallRows.length > 0) {
-				parts.push(formatPitfallGuidance(pitfallRows));
-			}
-			console.log(parts.length > 0 ? parts.join("\n\n") : "未检索到匹配的历史踩坑或关键决定。");
-		}
-		return;
-	}
-
-	if (cmd === "intent") {
-		const raw = await readStdinText();
-		let req: IntentMutationRequest;
-		if (!raw) {
-			req = { op: "view", project: getFlagStr(flags, "project") ?? projectKey ?? undefined };
-		} else {
-			try {
-				req = JSON.parse(raw) as IntentMutationRequest;
-			} catch (e) {
-				console.error(`stdin JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
-				process.exit(1);
-			}
-		}
-		if (getFlagBool(flags, "dry-run")) req.dryRun = true;
-		const res = mutateProjectIntent(config, paths, req, projectKey);
-		if (!res.ok) {
-			console.error(res.message);
-			process.exit(1);
-		}
-		console.log(res.message);
-		return;
-	}
-
-	if (cmd === "decision") {
-		const raw = await readStdinText();
-		if (!raw) {
-			console.error(
-				'clue decision 需要从 stdin 传入 JSON 请求，例如：clue decision <<\'EOF\'\n{"op":"add","topic":"architecture","decision":"...","rationale":"...","assumptions":"...","revisitWhen":"...","evidence":"..."}\nEOF',
-			);
-			process.exit(1);
-		}
-		let req: DecisionMutationRequest;
-		try {
-			req = JSON.parse(raw) as DecisionMutationRequest;
-		} catch (e) {
-			console.error(`stdin JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
-			process.exit(1);
-		}
-		const res = mutateDecision(paths, req, projectKey, config.readOnlyGuard);
-		if (!res.ok) {
-			console.error(res.message);
-			process.exit(1);
-		}
-		console.log(res.message);
-		return;
-	}
-
-	if (cmd === "index") {
-		const harnessFlag = getFlagStr(flags, "harness")?.toLowerCase() as RecallHarness | undefined;
-		const rebuild = getFlagBool(flags, "rebuild");
-		const summary = indexRecallSessions(paths.recallDbPath, {
-			harness: harnessFlag,
-			rebuild,
-			lockPath: paths.recallLockPath,
-			worktreeSuffixes: config.worktreeSuffixes,
-			workspaceRoots: config.workspaceRoots,
+	const submitDraft = (kind: DraftKind, request: Record<string, unknown>) => {
+		// Untyped stdin JSON: the draft planner validates every field (same check runs again at apply time).
+		const typed = request as Parameters<typeof addDraft>[3];
+		const res = addDraft(config, paths, kind, typed, {
+			projectKey,
+			harness: invoker.harness,
+			session: invoker.session,
+			skipSlots: skippedIntentSlots(config, cwd),
 		});
-		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify(summary, null, 2));
+		if (!res.ok) fail(res.message);
+		console.log(res.message);
+	};
+	const draft = async (kind: DraftKind, usage: string) =>
+		submitDraft(kind, parseJsonInput<Record<string, unknown>>(await readStdinText(), usage));
+
+	switch (cmd) {
+		case "boot": {
+			const snap = buildBootSnapshot(config, paths, cwd);
+			const fmt = (getFlagStr(flags, "format") ?? "text").toLowerCase();
+			if (fmt === "agy") console.log(JSON.stringify(formatAgySessionStart(snap)));
+			else if (fmt === "claude") console.log(JSON.stringify(formatClaudeHookOutput("SessionStart", snap.block)));
+			else if (fmt === "json") console.log(JSON.stringify(snap, null, 2));
+			else console.log(snap.block);
 			return;
 		}
-		if (!getFlagBool(flags, "quiet")) {
-			console.log(
-				`✅ clue 索引完成（${summary.elapsedMs}ms）：扫描 ${summary.scannedFiles} 项，更新 ${summary.indexedSessions} 会话（${summary.indexedMessages} 条消息），跳过未变更 ${summary.skippedUnchanged} 项。`,
-			);
-			for (const [h, st] of Object.entries(summary.byHarness)) {
-				console.log(`  - ${h}: ${st.sessions} sessions, ${st.messages} messages`);
+
+		case "view": {
+			const view = readHotMemoryView(config, paths, projectKey);
+			console.log(json ? JSON.stringify({ projectKey, ...view }, null, 2) : view.formatted);
+			return;
+		}
+
+		case "status": {
+			const view = readHotMemoryView(config, paths, projectKey);
+			const health = evaluateMemoryHealth(config, paths, projectKey);
+			const tampering = detectUnauthorizedChanges(paths.home);
+			const intentCard = getProjectIntent(paths.intentsPath, projectKey);
+			const drafts = readDrafts(paths);
+			const commits = getRecentMemoryCommits(paths.home, 4);
+			if (json) {
+				console.log(JSON.stringify({ home: paths.home, projectKey, health, tampering, intentCard, drafts, commits }, null, 2));
+				return;
 			}
-		}
-		return;
-	}
-
-	if (cmd === "sources") {
-		const rows = getRecallSources(paths.recallDbPath);
-		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify({ recallDbPath: paths.recallDbPath, sources: rows }, null, 2));
+			const m = health.metrics;
+			const projPct = Math.round((view.scoped.projectChars / config.limits.singleProjectChars) * 100);
+			console.log(
+				[
+					`📚 clue 个人记忆状态（${paths.home}）`,
+					...(tampering.dirty ? [`⚠️ 有绕过 clue 的改动：${tampering.files.join(", ")}（clue restore 丢弃 / clue accept 保留）`] : []),
+					`- PROFILE.md：${m.profileChars} / ${m.profileLimit} 字 (${m.profilePct}%)`,
+					`- PROJECTS.md：全局 ${m.globalChars} / ${m.globalLimit} 字 (${m.globalPct}%) | 当前项目 (${projectKey ?? "无"}) ${view.scoped.projectChars} / ${config.limits.singleProjectChars} 字 (${projPct}%)`,
+					`- 意图卡 (${projectKey ?? "无"})：${intentCard ? `更新于 ${intentCard.updatedAt.slice(0, 16)}` : "尚未建立"}`,
+					...(intentCard ? formatIntentCard(intentCard).split("\n").map(l => `  ${l}`) : []),
+					`- 活跃记忆：${LEDGER_KINDS.map(k => `${ledgerLabel(k)} ${m.active[k]} 条`).join(" | ")}（缺溯源 ${m.withoutEvidence} 条，主动查阅 ${m.totalHits} 次）`,
+					`- 待确认草稿：${drafts.length} 条`,
+					`- 健康：${health.status === "healthy" ? "健康" : `需留意（${health.reasons.join("；")}）`}`,
+					`- 最近提交：`,
+					...(commits.length > 0 ? commits.map(c => `  ${c}`) : ["  (暂无)"]),
+				].join("\n"),
+			);
 			return;
 		}
-		if (rows.length === 0) {
-			console.log("尚未建立会话索引，请先运行 `clue index`。");
+
+		case "search": {
+			const query = positionals.slice(1).join(" ").trim();
+			const limRaw = Number.parseInt(getFlagStr(flags, "limit") ?? "4", 10);
+			const limit = Math.max(1, Math.min(10, Number.isFinite(limRaw) ? limRaw : 4));
+			const includeInactive = getFlagBool(flags, "all");
+			const type = (getFlagStr(flags, "type") ?? "all").toLowerCase();
+			const want = (k: string) => type === "all" || type === k;
+			const decisions = want("decision") ? searchLedger<DecisionRow>(paths, "decision", query, projectKey, limit, includeInactive) : [];
+			const pitfalls = want("pitfall") ? searchLedger<PitfallRow>(paths, "pitfall", query, projectKey, limit, includeInactive) : [];
+			const notes = want("note") ? searchLedger<NoteRow>(paths, "note", query, projectKey, limit, includeInactive) : [];
+			// Explicit lookups are the only thing that counts as a "hit" (usefulness signal for cold-item audits).
+			if (query) {
+				recordHits(paths, [
+					...decisions.map(r => `decision:${r.id}`),
+					...pitfalls.map(r => `pitfall:${r.id}`),
+					...notes.map(r => `note:${r.id}`),
+				]);
+			}
+			if (json) {
+				console.log(JSON.stringify({ query, project: projectKey, decisions, pitfalls, notes }, null, 2));
+				return;
+			}
+			const parts = [
+				...(decisions.length ? [formatDecisionGuidance(decisions)] : []),
+				...(pitfalls.length ? [formatPitfallGuidance(pitfalls)] : []),
+				...(notes.length ? [formatNoteGuidance(notes)] : []),
+			];
+			console.log(parts.length > 0 ? parts.join("\n\n") : "未检索到匹配的记忆（可换几种说法用 | 分隔再查）。");
 			return;
 		}
-		console.log(`📚 clue 跨 Harness 原始会话索引（${paths.recallDbPath}）：`);
-		for (const r of rows) {
-			console.log(`  - ${r.harness.padEnd(9)} ${String(r.sessions).padStart(5)} sessions | ${String(r.messages).padStart(7)} msgs | 最新: ${r.latestUpdated.slice(0, 19)}`);
-		}
-		return;
-	}
 
-	if (cmd === "recall") {
-		const harnessFlag = getFlagStr(flags, "harness")?.toLowerCase() as RecallHarness | undefined;
-		if (!getFlagBool(flags, "no-refresh")) {
-			indexRecallSessions(paths.recallDbPath, {
-				harness: harnessFlag,
+		case "intent": {
+			const raw = await readStdinText();
+			if (!raw) {
+				const res = mutateProjectIntent(config, paths, { op: "view", project: projectKey ?? undefined }, projectKey);
+				console.log(res.message);
+				return;
+			}
+			return submitDraft("intent", parseJsonInput<Record<string, unknown>>(raw, ""));
+		}
+
+		case "note":
+			return draft("note", 'clue note 需要 stdin JSON，例如：{"op":"add","content":"...","tags":"别名1, 别名2","evidence":"..."}');
+		case "pitfall":
+			return draft(
+				"pitfall",
+				'clue pitfall 需要 stdin JSON，例如：{"op":"add","symptom":"...","rootCause":"...","historicalFix":"...","rethinkHint":"...","tags":"...","evidence":"..."}',
+			);
+		case "decision":
+			return draft(
+				"decision",
+				'clue decision 需要 stdin JSON，例如：{"op":"add","topic":"...","decision":"...","rationale":"...","assumptions":"...","revisitWhen":"...","evidence":"..."}',
+			);
+		case "curate": {
+			const req = parseJsonInput<Record<string, unknown>>(
+				await readStdinText(),
+				'clue curate 需要 stdin JSON，例如：{"target":"profile","scope":"技术底座","operations":[...]}',
+			);
+			if (req.target !== "profile" && req.target !== "projects") fail('curate 的 target 必须是 "profile" 或 "projects"。');
+			return submitDraft(req.target, req);
+		}
+
+		case "drafts":
+			console.log(json ? JSON.stringify(readDrafts(paths), null, 2) : formatDraftList(readDrafts(paths)));
+			return;
+
+		case "apply": {
+			const selector = positionals.slice(1).join(" ");
+			if (!selector.trim()) fail("用法：clue apply <编号...|all>（只写入用户已确认的草稿）");
+			const res = applyDrafts(config, paths, selector, invoker);
+			if (!res.ok) fail(res.message);
+			console.log(res.message);
+			return;
+		}
+
+		case "drop": {
+			const selector = positionals.slice(1).join(" ");
+			if (!selector.trim()) fail("用法：clue drop <编号...|all>");
+			const res = dropDrafts(paths, selector);
+			if (!res.ok) fail(res.message);
+			console.log(res.message);
+			return;
+		}
+
+		case "wrap": {
+			const notice = buildTurnNotice(config, paths, "收尾", cwd, {});
+			console.log(notice ?? (isWorkerRole() ? "只读执行窗格不执行收尾。" : "（无收尾内容）"));
+			return;
+		}
+
+		case "index": {
+			const summary = indexRecallSessions(paths.recallDbPath, {
+				harness: getFlagStr(flags, "harness")?.toLowerCase() as RecallHarness | undefined,
+				rebuild: getFlagBool(flags, "rebuild"),
 				lockPath: paths.recallLockPath,
 				worktreeSuffixes: config.worktreeSuffixes,
 				workspaceRoots: config.workspaceRoots,
 			});
-		}
-		const query = positionals.slice(1).join(" ").trim();
-		const limRaw = Number.parseInt(getFlagStr(flags, "limit") ?? "8", 10);
-		const limit = Math.max(1, Math.min(30, Number.isFinite(limRaw) ? limRaw : 8));
-		const roleFlag = getFlagStr(flags, "role")?.toLowerCase();
-		const role = roleFlag === "user" || roleFlag === "assistant" ? roleFlag : undefined;
-		const explicitProject = getFlagStr(flags, "project")?.trim().toLowerCase() ?? null;
-		const hits = recallSessions(paths.recallDbPath, {
-			query,
-			harness: harnessFlag,
-			project: explicitProject ?? projectKey,
-			role,
-			since: getFlagStr(flags, "since"),
-			limit,
-			includeNoise: getFlagBool(flags, "all"),
-		});
-		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify({ query, count: hits.length, hits }, null, 2));
-			return;
-		}
-		if (hits.length === 0) {
-			console.log(`未检索到匹配 "${query}" 的历史原始对话（可换近义词重试，或检查 \`clue sources\`）。`);
-			return;
-		}
-		console.log(`🔎 clue 历史会话召回（命中 ${hits.length} 条；可用 \`clue show <id> --around <seq>\` 展开前后文）：\n`);
-		for (const h of hits) {
-			const shortId = h.sessionId.length > 26 ? h.sessionId.slice(0, 26) : h.sessionId;
-			console.log(
-				`[${shortId} | ${h.harness} | proj=${h.project} | #${h.seq} ${h.role} | ${h.ts.slice(0, 10)}${h.isNoise ? " | low-priority" : ""}]`,
-			);
-			console.log(`  标题: ${h.title}`);
-			console.log(`  原话: ${h.snippet}\n`);
-		}
-		return;
-	}
-
-	if (cmd === "show") {
-		const idPrefix = positionals[1]?.trim() ?? "";
-		if (!idPrefix) {
-			console.error("用法：clue show <session-id-prefix> [--around <seq>] [--window 4] [--full]");
-			process.exit(1);
-		}
-		const aroundStr = getFlagStr(flags, "around");
-		const winStr = getFlagStr(flags, "window");
-		const offStr = getFlagStr(flags, "offset");
-		const limStr = getFlagStr(flags, "limit");
-		const res = showSessionWindow(paths.recallDbPath, {
-			idPrefix,
-			around: aroundStr ? Number.parseInt(aroundStr, 10) : undefined,
-			window: winStr ? Number.parseInt(winStr, 10) : undefined,
-			offset: offStr ? Number.parseInt(offStr, 10) : undefined,
-			limit: limStr ? Number.parseInt(limStr, 10) : undefined,
-			full: getFlagBool(flags, "full"),
-		});
-		if (!res.ok) {
-			console.error(res.message);
-			process.exit(1);
-		}
-		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify({ session: res.session, messages: res.messages }, null, 2));
-		} else {
-			console.log(res.message);
-		}
-		return;
-	}
-
-	if (cmd === "curate") {
-		const raw = await readStdinText();
-		if (!raw) {
-			console.error("clue curate 需要从 stdin 传入 JSON 请求，例如：clue curate <<'EOF'\n{\"target\":\"profile\",\"operations\":[...]}\nEOF");
-			process.exit(1);
-		}
-		let req: CurateRequest;
-		try {
-			req = JSON.parse(raw) as CurateRequest;
-		} catch (e) {
-			console.error(`stdin JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
-			process.exit(1);
-		}
-		if (getFlagBool(flags, "dry-run")) req.dryRun = true;
-		const res = curateHotMemory(config, paths, req, projectKey);
-		if (!res.ok) {
-			console.error(res.message);
-			process.exit(1);
-		}
-		console.log(res.message);
-		return;
-	}
-
-	if (cmd === "pitfall") {
-		const raw = await readStdinText();
-		if (!raw) {
-			console.error("clue pitfall 需要从 stdin 传入 JSON 请求，例如：clue pitfall <<'EOF'\n{\"op\":\"add\",\"symptom\":...,\"rootCause\":...,\"historicalFix\":...,\"rethinkHint\":...,\"evidence\":...}\nEOF");
-			process.exit(1);
-		}
-		let req: PitfallMutationRequest;
-		try {
-			req = JSON.parse(raw) as PitfallMutationRequest;
-		} catch (e) {
-			console.error(`stdin JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
-			process.exit(1);
-		}
-		const res = mutatePitfall(paths, req, projectKey, config.readOnlyGuard);
-		if (!res.ok) {
-			console.error(res.message);
-			process.exit(1);
-		}
-		console.log(res.message);
-		return;
-	}
-
-	if (cmd === "dream") {
-		if (getFlagBool(flags, "mark-done")) {
-			const meta = markDreamDone(paths, getFlagStr(flags, "summary"));
-			console.log(`已记录本次做梦体检完成时间：${meta.lastDreamAt}`);
-			return;
-		}
-		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify(evaluateMemoryHealth(config, paths, projectKey, cwd), null, 2));
-		} else {
-			console.log(buildDreamPacket(config, paths, projectKey, cwd));
-		}
-		return;
-	}
-
-	if (cmd === "export") {
-		const bundle = buildWebExportBundle(config, paths, projectKey);
-		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify(bundle, null, 2));
-		} else {
-			console.log(bundle.text);
-		}
-		return;
-	}
-
-	if (cmd === "log") {
-		const lim = Number.parseInt(getFlagStr(flags, "limit") ?? "10", 10);
-		const commits = getRecentMemoryCommits(paths.home, Number.isFinite(lim) ? lim : 10);
-		console.log(commits.length > 0 ? commits.join("\n") : "(暂无 Git 提交记录)");
-		return;
-	}
-
-	if (cmd === "undo") {
-		const res = undoLastMemoryCommit(paths.home, {
-			guardedFiles: getReadOnlyGuardedFiles(paths),
-			restoreReadOnly: config.readOnlyGuard,
-		});
-		if (!res.ok) {
-			console.error(res.message);
-			process.exit(1);
-		}
-		console.log(res.message);
-		return;
-	}
-
-	if (cmd === "unlock") {
-		const unlocked = unlockFilesWritable(getReadOnlyGuardedFiles(paths));
-		console.log(`🔓 已临时解锁 ${unlocked.length} 个核心记忆文件为可写状态（手动编辑完后可运行 \`clue lock\` 重新加锁）。`);
-		return;
-	}
-
-	if (cmd === "lock") {
-		const locked = lockFilesReadOnly(getReadOnlyGuardedFiles(paths));
-		console.log(`🔒 已锁定 ${locked.length} 个核心记忆文件为只读（0444），防止任意 Harness 绕过校验直接篡改。`);
-		return;
-	}
-
-	if (cmd === "doctor") {
-		const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
-		checks.push({ name: "CLUE_HOME", ok: existsSync(paths.home), detail: paths.home });
-		checks.push({ name: "PROFILE.md", ok: existsSync(paths.profilePath), detail: paths.profilePath });
-		checks.push({ name: "PROJECTS.md", ok: existsSync(paths.projectsPath), detail: paths.projectsPath });
-		checks.push({ name: "Git repo", ok: existsSync(join(paths.home, ".git")), detail: join(paths.home, ".git") });
-		const tampering = detectUnauthorizedChanges(paths.home);
-		checks.push({
-			name: "Git integrity sentinel",
-			ok: !tampering.dirty,
-			detail: tampering.dirty ? `uncommitted edits: ${tampering.files.join(", ")}` : "clean",
-		});
-		try {
-			const db = openPitfallDb(paths.dbPath);
-			const cnt = (db.query("SELECT COUNT(*) as c FROM pitfalls").get() as { c: number }).c;
-			db.close();
-			const ddb = openDecisionDb(paths.dbPath);
-			const dcnt = (ddb.query("SELECT COUNT(*) as c FROM decisions").get() as { c: number }).c;
-			ddb.close();
-			checks.push({ name: "SQLite FTS5 pitfalls+decisions", ok: true, detail: `${cnt} pitfalls, ${dcnt} decisions` });
-		} catch (e) {
-			checks.push({ name: "SQLite FTS5 pitfalls+decisions", ok: false, detail: String(e) });
-		}
-
-		const adapters = getFlagBool(flags, "adapters") ? inspectHarnessAdapters() : undefined;
-
-		if (getFlagBool(flags, "json")) {
-			console.log(JSON.stringify({ ok: checks.every(c => c.ok), checks, ...(adapters ? { adapters } : {}) }, null, 2));
-		} else {
-			for (const c of checks) {
-				console.log(`${c.ok ? "✅" : "❌"} ${c.name}: ${c.detail}`);
+			if (json) {
+				console.log(JSON.stringify(summary, null, 2));
+				return;
 			}
-			if (adapters) {
-				console.log("\n🔌 Harness 接入状态（7 大工具巡检）：");
-				for (const a of adapters) {
-					const icon = !a.detected ? "⚪" : a.hookWired ? "✅" : "⚠️";
-					console.log(`  ${icon} ${a.harness.padEnd(9)} ${a.detail}`);
+			if (!getFlagBool(flags, "quiet")) {
+				console.log(
+					`✅ clue 索引完成（${summary.elapsedMs}ms）：扫描 ${summary.scannedFiles} 项，更新 ${summary.indexedSessions} 会话（${summary.indexedMessages} 条消息），跳过未变更 ${summary.skippedUnchanged} 项。`,
+				);
+				for (const [h, st] of Object.entries(summary.byHarness)) console.log(`  - ${h}: ${st.sessions} sessions, ${st.messages} messages`);
+			}
+			return;
+		}
+
+		case "sources": {
+			const rows = getRecallSources(paths.recallDbPath);
+			if (json) {
+				console.log(JSON.stringify({ recallDbPath: paths.recallDbPath, sources: rows }, null, 2));
+				return;
+			}
+			if (rows.length === 0) {
+				console.log("尚未建立会话索引，请先运行 `clue index`。");
+				return;
+			}
+			console.log(`📚 clue 跨 Harness 原始会话索引（${paths.recallDbPath}）：`);
+			for (const r of rows) {
+				console.log(
+					`  - ${r.harness.padEnd(9)} ${String(r.sessions).padStart(5)} sessions | ${String(r.messages).padStart(7)} msgs | 最新: ${r.latestUpdated.slice(0, 19)}`,
+				);
+			}
+			return;
+		}
+
+		case "recall": {
+			const harnessFlag = getFlagStr(flags, "harness")?.toLowerCase() as RecallHarness | undefined;
+			if (!getFlagBool(flags, "no-refresh")) {
+				indexRecallSessions(paths.recallDbPath, {
+					harness: harnessFlag,
+					lockPath: paths.recallLockPath,
+					worktreeSuffixes: config.worktreeSuffixes,
+					workspaceRoots: config.workspaceRoots,
+				});
+			}
+			const query = positionals.slice(1).join(" ").trim();
+			const limRaw = Number.parseInt(getFlagStr(flags, "limit") ?? "8", 10);
+			const roleFlag = getFlagStr(flags, "role")?.toLowerCase();
+			const hits = recallSessions(paths.recallDbPath, {
+				query,
+				harness: harnessFlag,
+				project: getFlagStr(flags, "project")?.trim().toLowerCase() ?? projectKey,
+				role: roleFlag === "user" || roleFlag === "assistant" ? roleFlag : undefined,
+				since: getFlagStr(flags, "since"),
+				limit: Math.max(1, Math.min(30, Number.isFinite(limRaw) ? limRaw : 8)),
+				includeNoise: getFlagBool(flags, "all"),
+			});
+			if (json) {
+				console.log(JSON.stringify({ query, count: hits.length, hits }, null, 2));
+				return;
+			}
+			if (hits.length === 0) {
+				console.log(`未检索到匹配 "${query}" 的历史原始对话（可换近义词重试，或检查 \`clue sources\`）。`);
+				return;
+			}
+			console.log(`🔎 clue 历史会话召回（命中 ${hits.length} 条；可用 \`clue show <id> --around <seq>\` 展开前后文）：\n`);
+			for (const h of hits) {
+				const shortId = h.sessionId.length > 26 ? h.sessionId.slice(0, 26) : h.sessionId;
+				console.log(
+					`[${shortId} | ${h.harness} | proj=${h.project} | #${h.seq} ${h.role} | ${h.ts.slice(0, 10)}${h.isNoise ? " | low-priority" : ""}]`,
+				);
+				console.log(`  标题: ${h.title}`);
+				console.log(`  原话: ${h.snippet}\n`);
+			}
+			return;
+		}
+
+		case "show": {
+			const idPrefix = positionals[1]?.trim() ?? "";
+			if (!idPrefix) fail("用法：clue show <session-id-prefix> [--around <seq>] [--window 4] [--full]");
+			if (!getFlagBool(flags, "no-refresh")) {
+				// The conversation being inspected may be the current one, so pick up its latest messages first.
+				indexRecallSessions(paths.recallDbPath, {
+					lockPath: paths.recallLockPath,
+					worktreeSuffixes: config.worktreeSuffixes,
+					workspaceRoots: config.workspaceRoots,
+				});
+			}
+			const num = (k: string) => (getFlagStr(flags, k) ? Number.parseInt(getFlagStr(flags, k)!, 10) : undefined);
+			const res = showSessionWindow(paths.recallDbPath, {
+				idPrefix,
+				around: num("around"),
+				window: num("window"),
+				offset: num("offset"),
+				limit: num("limit"),
+				full: getFlagBool(flags, "full"),
+			});
+			if (!res.ok) fail(res.message);
+			console.log(json ? JSON.stringify({ session: res.session, messages: res.messages }, null, 2) : res.message);
+			return;
+		}
+
+		case "dream": {
+			if (getFlagBool(flags, "mark-done")) {
+				const meta = markDreamDone(paths, getFlagStr(flags, "summary"));
+				console.log(`已记录本次记忆体检完成时间：${meta.lastDreamAt}`);
+				return;
+			}
+			console.log(
+				json ? JSON.stringify(evaluateMemoryHealth(config, paths, projectKey, cwd), null, 2) : buildDreamPacket(config, paths, projectKey, cwd),
+			);
+			return;
+		}
+
+		case "export": {
+			const bundle = buildWebExportBundle(config, paths, projectKey);
+			console.log(json ? JSON.stringify(bundle, null, 2) : bundle.text);
+			return;
+		}
+
+		case "log": {
+			const lim = Number.parseInt(getFlagStr(flags, "limit") ?? "10", 10);
+			const commits = getRecentMemoryCommits(paths.home, Number.isFinite(lim) ? lim : 10);
+			console.log(commits.length > 0 ? commits.join("\n") : "(暂无 Git 提交记录)");
+			return;
+		}
+
+		case "undo": {
+			if (isWorkerRole()) fail("只读执行窗格不能撤回记忆。");
+			const res = undoLastMemoryCommit(paths.home, {
+				guardedFiles: getReadOnlyGuardedFiles(paths),
+				restoreReadOnly: config.readOnlyGuard,
+			});
+			if (!res.ok) fail(res.message);
+			console.log(res.message);
+			return;
+		}
+
+		case "restore": {
+			if (isWorkerRole()) fail("只读执行窗格不能修改记忆。");
+			const res = restoreTruthFiles(paths.home, config.readOnlyGuard);
+			if (!res.ok) fail(res.message);
+			console.log(res.message);
+			return;
+		}
+
+		case "accept": {
+			if (isWorkerRole()) fail("只读执行窗格不能修改记忆。");
+			const res = acceptManualEdits(paths.home, positionals.slice(1).join(" "), config.readOnlyGuard);
+			if (!res.ok) fail(res.message);
+			console.log(res.message);
+			return;
+		}
+
+		case "unlock": {
+			const unlocked = unlockFilesWritable(getReadOnlyGuardedFiles(paths));
+			console.log(`🔓 已解锁 ${unlocked.length} 个记忆文件。手改完后运行 \`clue accept "<原因>"\` 提交，或 \`clue restore\` 放弃。`);
+			return;
+		}
+
+		case "lock": {
+			const locked = lockFilesReadOnly(getReadOnlyGuardedFiles(paths));
+			console.log(`🔒 已把 ${locked.length} 个记忆文件设为只读。`);
+			return;
+		}
+
+		case "doctor": {
+			const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
+			checks.push({ name: "CLUE_HOME", ok: existsSync(paths.home), detail: paths.home });
+			checks.push({ name: "Git repo", ok: existsSync(join(paths.home, ".git")), detail: join(paths.home, ".git") });
+			const tampering = detectUnauthorizedChanges(paths.home);
+			checks.push({
+				name: "Integrity",
+				ok: !tampering.dirty,
+				detail: tampering.dirty ? `edited outside clue: ${tampering.files.join(", ")}` : "clean",
+			});
+			for (const kind of LEDGER_KINDS) {
+				const file = ledgerFile(paths, kind);
+				const lines = existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(l => l.trim()).length : 0;
+				const parsed = readLedger(paths, kind).length;
+				checks.push({
+					name: `${kind}s.jsonl`,
+					ok: lines === parsed,
+					detail: `${parsed} rows (${listActive(paths, kind).length} active)${lines !== parsed ? `, ${lines - parsed} unreadable lines` : ""}`,
+				});
+			}
+			checks.push({ name: "Drafts", ok: true, detail: `${readDrafts(paths).length} pending` });
+			const adapters = getFlagBool(flags, "adapters") ? inspectHarnessAdapters() : undefined;
+			if (json) {
+				console.log(JSON.stringify({ ok: checks.every(c => c.ok), checks, ...(adapters ? { adapters } : {}) }, null, 2));
+			} else {
+				for (const c of checks) console.log(`${c.ok ? "✅" : "❌"} ${c.name}: ${c.detail}`);
+				if (adapters) {
+					console.log("\n🔌 Harness 接入：");
+					for (const a of adapters) {
+						const icon = !a.detected ? "⚪" : a.hookWired ? "✅" : "⚠️";
+						console.log(`  ${icon} ${a.harness.padEnd(9)} ${a.detail}`);
+					}
 				}
 			}
+			if (!checks.every(c => c.ok)) process.exit(1);
+			return;
 		}
-		if (!checks.every(c => c.ok)) process.exit(1);
-		return;
-	}
 
-	console.error(`未知命令：${cmd}。运行 \`clue help\` 查看用法。`);
-	process.exit(1);
+		default:
+			fail(`未知命令：${cmd}。运行 \`clue help\` 查看用法。`);
+	}
 }
 
 main().catch(err => {
