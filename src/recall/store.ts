@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { withMemoryLock } from "../core/lock.ts";
 import {
@@ -165,13 +165,13 @@ export function indexRecallSessions(
 	return withMemoryLock(lockPath, () => {
 		const started = Date.now();
 		const homeDir = options.homeDir ?? homedir();
-		if (options.rebuild) {
-			rmSync(dbPath, { force: true });
-			rmSync(`${dbPath}-wal`, { force: true });
-			rmSync(`${dbPath}-shm`, { force: true });
-		}
-
 		const db = openRecallDb(dbPath);
+		if (options.rebuild) {
+			// Force a full re-parse but keep every session row: harnesses delete old transcripts,
+			// so this index can be the last copy of a conversation. Re-parsed sessions overwrite their rows.
+			if (options.harness) db.query("DELETE FROM index_sources WHERE harness = ?").run(options.harness);
+			else db.exec("DELETE FROM index_sources");
+		}
 		let scannedFiles = 0;
 		let indexedSessions = 0;
 		let skippedUnchanged = 0;
@@ -280,7 +280,7 @@ export function indexRecallSessions(
 			) => {
 				if (options.harness && options.harness !== harness) return;
 				const existing = getSource.get(dbKey) as { mtime_ms: number; size_bytes: number } | null;
-				const existingMap = getExistingUpdatedMap(harness);
+				const existingMap = options.rebuild ? new Map<string, string>() : getExistingUpdatedMap(harness);
 				const loaded = loader(existingMap);
 				if (!loaded) return;
 				scannedFiles++;

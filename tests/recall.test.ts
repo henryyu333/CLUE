@@ -31,6 +31,19 @@ describe("cross-harness recall & redaction", () => {
 		expect(cleaned).toContain("[REDACTED]");
 	});
 
+	test("rebuild re-parses sources but keeps sessions whose transcript has since been deleted", () => {
+		const agyDir = join(fakeHome, ".gemini", "antigravity", "brain", "gone-1", ".system_generated", "logs");
+		mkdirSync(agyDir, { recursive: true });
+		writeFileSync(
+			join(agyDir, "transcript.jsonl"),
+			JSON.stringify({ source: "USER_EXPLICIT", type: "USER_INPUT", created_at: "2026-11-01T00:00:00Z", content: "唯一的 Zephyr 迁移讨论" }),
+		);
+		indexRecallSessions(recallDb, { homeDir: fakeHome });
+		rmSync(join(fakeHome, ".gemini"), { recursive: true, force: true });
+		indexRecallSessions(recallDb, { homeDir: fakeHome, rebuild: true });
+		expect(recallSessions(recallDb, { query: "Zephyr", includeNoise: true }).length).toBe(1);
+	});
+
 	test("indexes AGY, Claude, and zstd-compressed Codex transcripts incrementally and supports --around show", () => {
 		// 1) AGY transcript
 		const agyDir = join(fakeHome, ".gemini", "antigravity", "brain", "conv-agy-1", ".system_generated", "logs");

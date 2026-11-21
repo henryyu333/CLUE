@@ -130,7 +130,11 @@ function inferProjectFromMentions(
 	const re = new RegExp(`(?:/Users|/home)/[^/\\s]+/(?:${rootAlt})/[^/\\s"'\`)<>]+`, "g");
 	const counts = new Map<string, number>();
 	for (const msg of messages) {
-		for (const m of msg.content.matchAll(re)) counts.set(m[0], (counts.get(m[0]) ?? 0) + 1);
+		for (const m of msg.content.matchAll(re)) {
+			// `~/workspace/resume.pdf` names a file, not a project directory.
+			if (/\.[a-z0-9]{1,6}$/i.test(m[0])) continue;
+			counts.set(m[0], (counts.get(m[0]) ?? 0) + 1);
+		}
 	}
 	const byProject = new Map<string, number>();
 	for (const [path, n] of counts) {
