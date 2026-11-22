@@ -132,6 +132,36 @@ describe("draft box: nothing is written until apply", () => {
 		expect(detectUnauthorizedChanges(paths.home).dirty).toBe(false);
 	});
 
+	test("update and supersede preserve target project when project is omitted, and format previews in plain Chinese", () => {
+		draftAndApply("decision", {
+			op: "add",
+			project: "alpha",
+			decision: "API Key 改存本地 0600 文件",
+			rationale: "避免自签名每次更新重弹钥匙圈密码",
+		}, "alpha");
+
+		// Drafting an update from a different project ("beta") must NOT overwrite project to "beta".
+		const upd = draft("decision", { op: "update", id: 1, topic: "api-key-storage", evidence: "alpha v1.2" }, "beta");
+		expect(upd.preview.join("\n")).toContain("API Key 改存本地 0600 文件");
+		expect(upd.preview.join("\n")).toContain("主题：");
+		expect(upd.preview.join("\n")).toContain("溯源依据：");
+		expect(upd.preview.join("\n")).not.toContain("beta");
+
+		const applied = applyDrafts(config, paths, String(upd.id), { harness: "test", session: "s1" });
+		expect(applied.ok).toBe(true);
+		expect(listActive(paths, "decision")[0]?.project).toBe("alpha");
+
+		// Superseding without `project` from "beta" also inherits the superseded row's project ("alpha").
+		draftAndApply("decision", {
+			op: "supersede",
+			id: 1,
+			topic: "api-key-storage",
+			decision: "切到系统安全 enclave 存储",
+			rationale: "正式签名后不再弹窗",
+		}, "beta");
+		expect(listActive(paths, "decision")[0]?.project).toBe("alpha");
+	});
+
 	test("read-only workers can neither draft nor apply", () => {
 		process.env.CLUE_ROLE = "worker";
 		expect(addDraft(config, paths, "note", { op: "add", content: "x" }, ctx).ok).toBe(false);
@@ -349,6 +379,35 @@ describe("health & dream", () => {
 		expect(warm.metrics.coldItems).toHaveLength(0);
 	});
 
+	test("evidence check handles ~/ home paths and avoids cross-repo false alarms for global entries", () => {
+		const fakeHome = join(tempHome, "home");
+		mkdirSync(join(fakeHome, ".agents", "skills", "demo"), { recursive: true });
+		writeFileSync(join(fakeHome, ".agents", "skills", "demo", "SKILL.md"), "# demo\n");
+
+		const otherRepo = join(tempHome, "other-repo");
+		mkdirSync(otherRepo, { recursive: true });
+		execFileSync("git", ["-C", otherRepo, "init", "-q", "-b", "main"]);
+
+		expect(verifyEvidenceAnchor("~/.agents/skills/demo/SKILL.md 说明", otherRepo, { homeDir: fakeHome }).status).toBe("valid");
+		expect(verifyEvidenceAnchor("~/.agents/skills/demo/MISSING.md", otherRepo, { homeDir: fakeHome }).status).toBe("stale-file-missing");
+
+		// Global entry referencing another repo's relative path should be unverifiable, not a false missing-file alarm.
+		expect(
+			verifyEvidenceAnchor("rakko commit deadbeef (cmd/rakko/test.go: helper)", otherRepo, { isGlobal: true }).status,
+		).toBe("unverifiable");
+		// Project-scoped entry referencing a missing file in the current repo IS a real stale-file-missing alert.
+		expect(verifyEvidenceAnchor("cmd/rakko/test.go", otherRepo, { isGlobal: false }).status).toBe("stale-file-missing");
+
+		draftAndApply("pitfall", { ...PITFALL, project: "global", evidence: "rakko commit deadbeef (cmd/rakko/test.go)" }, "other-repo");
+		const health = evaluateMemoryHealth(config, paths, "other-repo", otherRepo);
+		expect(health.metrics.staleEvidenceCount).toBe(0);
+		const dream = buildDreamPacket(config, paths, "other-repo", otherRepo);
+		expect(dream).toContain("结论前置");
+		expect(dream).toContain("零黑话与零隐含前提");
+		expect(dream).toContain("固定三段积木");
+		expect(dream).toContain("细节后置与低摩擦结尾");
+	});
+
 	test("web export scrubs secrets and includes notes", () => {
 		draftAndApply("note", { op: "add", content: "偏好紧凑排版" });
 		draftAndApply("intent", { goal: "导出干净上下文" }, "sample");
@@ -386,6 +445,9 @@ describe("adapter install", () => {
 		const ext = readFileSync(join(fakeHome, ".omp", "agent", "extensions", "clue-memory.ts"), "utf8");
 		expect(ext).not.toContain("__CLUE_");
 		expect(ext).toContain('"/tmp/mem"');
+		// Per-turn liveness check prevents false stale-adapter alerts in long-running OMP/pi sessions.
+		const beforeStartSection = ext.slice(ext.indexOf('pi.on("before_agent_start"'), ext.indexOf('pi.on("agent_end"'));
+		expect(beforeStartSection).toContain("noteHarnessSeen(paths, HARNESS)");
 
 		const status = inspectHarnessAdapters(fakeHome);
 		expect(status.find(s => s.harness === "claude")?.hookWired).toBe(true);

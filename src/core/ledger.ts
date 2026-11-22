@@ -321,6 +321,28 @@ function clip(text: string, max = 90): string {
 	return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
 }
 
+const COL_LABEL: Record<string, string> = {
+	project: "归属范围",
+	tags: "检索标签",
+	evidence: "溯源依据",
+	content: "内容",
+	symptom: "现象",
+	root_cause: "根因",
+	historical_fix: "当时解法",
+	rethink_hint: "重思提示",
+	topic: "主题",
+	decision: "决定内容",
+	rationale: "理由",
+	assumptions: "前提假设",
+	revisit_when: "复审条件",
+};
+
+function formatFieldVal(col: string, raw: string): string {
+	if (!raw) return "空";
+	if (col === "project" && raw === "global") return "全项目通用 (global)";
+	return raw;
+}
+
 export function planLedgerMutation(
 	kind: LedgerKind,
 	rows: readonly LedgerRow[],
@@ -370,12 +392,15 @@ export function planLedgerMutation(
 		}
 		if (req.op === "verify") {
 			target.verified_at = now;
-			if (req.evidence?.trim()) target.evidence = req.evidence.trim();
+			const updatedEvidence = req.evidence?.trim();
+			if (updatedEvidence) target.evidence = updatedEvidence;
 			return {
 				ok: true,
 				message: `确认${label} #${target.id} 仍是当前最优`,
 				rows: next,
-				changes: [`✓ ${label} #${target.id} 经本次复核仍成立：${clip(rowSummary(kind, target))}`],
+				changes: [
+					`✓ 复核${label} #${target.id} 仍成立${updatedEvidence ? "（并更新溯源）" : ""}：${clip(rowSummary(kind, target))}`,
+				],
 				id: target.id,
 			};
 		}
@@ -392,20 +417,25 @@ export function planLedgerMutation(
 		}
 		// update
 		const rec = target as unknown as Record<string, unknown>;
-		const changes: string[] = [];
+		const beforeSummary = clip(rowSummary(kind, target), 44);
+		const fieldChanges: string[] = [];
 		const setCol = (col: string, value: string | undefined) => {
 			if (value === undefined) return;
 			if (rec[col] === value) return;
 			if (spec.required.includes(col) && !value) return;
-			changes.push(`~ ${label} #${target.id}.${col}：「${clip(String(rec[col] ?? ""), 40)}」→「${clip(value, 60)}」`);
+			const colLabel = COL_LABEL[col] ?? col;
+			const prev = formatFieldVal(col, String(rec[col] ?? ""));
+			const nextVal = formatFieldVal(col, value);
+			fieldChanges.push(`  ${colLabel}：「${clip(prev, 40)}」→「${clip(nextVal, 60)}」`);
 			rec[col] = value;
 		};
 		for (const [col, val] of textFields) setCol(col, val);
 		setCol("tags", req.tags?.trim());
 		setCol("evidence", req.evidence?.trim());
 		if (req.project?.trim()) setCol("project", proj);
-		if (changes.length === 0) return { ok: false, message: `${label} #${target.id} 没有实质变动。` };
+		if (fieldChanges.length === 0) return { ok: false, message: `${label} #${target.id} 没有实质变动。` };
 		target.updated_at = now;
+		const changes = [`~ 修改${label} #${target.id}（${beforeSummary}）：`, ...fieldChanges];
 		return { ok: true, message: `更新${label} #${target.id}`, rows: next, changes, id: target.id };
 	}
 

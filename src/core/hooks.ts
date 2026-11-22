@@ -1,7 +1,7 @@
 import { inspectHarnessAdapters } from "../adapters/install.ts";
 import { getRecallSources, getRecentProjectSessionAnchors, refreshRecallIfStale } from "../recall/store.ts";
 import { isWorkerRole, type ClueConfig, type CluePaths } from "./config.ts";
-import { formatDraftList, readDrafts } from "./drafts.ts";
+import { formatDraftList, PLAIN_REPORT_RULES, readDrafts } from "./drafts.ts";
 import { detectUnauthorizedChanges } from "./git.ts";
 import { evaluateMemoryHealth } from "./health.ts";
 import { classifyPromptIntent } from "./intent.ts";
@@ -30,7 +30,7 @@ const WORKER_BANNER =
 	"【当前为只读执行窗格（CLUE_ROLE=worker）】以下背景与历史坑只作审美和排障参考；不起草、不写入记忆，不执行收尾流程。";
 
 const MEMORY_DUTY =
-	"平时不打扰用户。工作中遇到值得长期记住的内容（用户的偏好、习惯或个人事实，项目方向变化，踩坑根因，关键决定），随时用 clue 把它记进待确认草稿箱（`clue note|pitfall|decision|intent`，OMP 里用 memory_draft）：草稿不生效，不必先问，可在 tags 里写同义词和别名方便以后检索。收尾或用户结束对话时，把草稿整理给用户确认后才写入。";
+	"平时不打扰用户。工作中遇到值得长期记住的内容（用户的偏好、习惯或个人事实，项目方向变化，踩坑根因，关键决定），随时用 clue 把它记进待确认草稿箱（`clue note|pitfall|decision|intent`，OMP 里用 memory_draft）：草稿不生效，不必先问，可在 tags 里写同义词和别名方便以后检索。收尾或用户结束对话时，把草稿用大白话按编号整理给用户确认后才写入。";
 
 const LOOKUP_HINT =
 	"查老坑/老决定/记忆：`clue search \"说法1 | 说法2\"`（用 | 分隔几种不同说法一起查）；翻过往原话：`clue recall \"<词>\"` / `clue show <id>`。";
@@ -180,8 +180,9 @@ export function buildTurnNotice(
 			[
 				"【clue 记忆体检】（仅当用户是在要求整理/体检记忆时执行）",
 				"1. 运行 `clue dream` 读取体检材料（溯源过期、冷门条目、重复项、全部活跃条目）。",
-				"2. 必要时对照当前代码和 git 核实；把每项整理建议起草进草稿箱（verify / supersede / delete / curate）。",
-				"3. 把完整草稿清单（编号 + 前后对比）给用户看，确认后 `clue apply`，最后 `clue dream --mark-done`。",
+				"2. 必要时对照当前代码和 git 核实；把每项整理建议起草进草稿箱（verify / supersede / delete / curate，reason 写人话说明）。",
+				`3. ${PLAIN_REPORT_RULES}`,
+				"4. 用户确认后再 `clue apply`，最后 `clue dream --mark-done`。",
 			].join("\n"),
 		);
 	} else if (intent.isWrapUp || intent.isCasualClose) {
@@ -215,7 +216,7 @@ export function buildTurnNotice(
 			);
 		}
 		lines.push(
-			`${step++}. 把完整草稿清单原样给用户看（编号 + 内容），问用户：全部写入 / 只写哪几条 / 要改哪条 / 全部丢弃。用户没明确同意前，不要写入。`,
+			`${step++}. ${PLAIN_REPORT_RULES} 用户没明确同意前，不要写入。`,
 			`${step++}. 用户确认后运行 \`clue apply <编号|all>\`（丢弃用 \`clue drop\`），把它输出的回执原样贴给用户。`,
 		);
 		if (intent.isCasualClose) {
@@ -227,7 +228,7 @@ export function buildTurnNotice(
 		notices.push(
 			[
 				"【clue 记忆维护】（仅当用户明确要求记住/修改/删除/撤回记忆时执行；只是普通用词就忽略）",
-				"- 记住或修改：起草对应草稿（note / pitfall / decision / intent；改个人名片或项目习惯用 profile / projects，先 `clue view` 核对原文），把草稿给用户确认后再 `clue apply`。",
+				`- 记住或修改：起草对应草稿（note / pitfall / decision / intent；改个人名片或项目习惯用 profile / projects，先 \`clue view\` 核对原文）。${PLAIN_REPORT_RULES} 用户确认后再 \`clue apply\`。`,
 				"- 撤回上一次写入：直接 `clue undo`，把结果告诉用户。",
 			].join("\n"),
 		);

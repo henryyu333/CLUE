@@ -1,8 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ClueConfig, CluePaths } from "./config.ts";
 import { countCommitsSince, getRecentMemoryCommits } from "./git.ts";
+import { PLAIN_REPORT_RULES } from "./drafts.ts";
 import { formatIntentCard, readIntentStore } from "./intents.ts";
 import { atomicWriteFileSync } from "./lock.ts";
 import { LEDGER_KINDS, ledgerLabel, listActive, rowSummary, type LedgerKind } from "./ledger.ts";
@@ -156,46 +158,86 @@ function resolveRepoRoot(cwd?: string): string | null {
 	return resolved;
 }
 
+function hasCommitInRepo(repoRoot: string, sha: string): boolean {
+	try {
+		execFileSync("git", ["-C", repoRoot, "cat-file", "-e", `${sha}^{commit}`], { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export interface VerifyEvidenceOptions {
+	/** True when the entry is scoped to `global`, so a repo-relative path may belong to another repo. */
+	isGlobal?: boolean;
+	/** Override home directory (primarily for tests). */
+	homeDir?: string;
+}
+
 /**
  * Zero-token local verification of file paths and git commits referenced in `evidence`.
  */
 export function verifyEvidenceAnchor(
 	evidence: string,
 	cwd?: string,
+	opts: VerifyEvidenceOptions = {},
 ): { status: EvidenceCheckItem["status"]; detail: string } {
 	const raw = evidence.trim();
 	if (!raw) return { status: "unverifiable", detail: "无溯源锚点" };
 
+	// 1) Home-relative paths like ~/.agents/skills/foo/SKILL.md are machine-global.
+	const homeMatch = raw.match(/(?:^|[\s(（;；,，:："'`])~\/((?:[a-zA-Z0-9_.-]+\/)*[a-zA-Z0-9_.-]+\.[a-zA-Z0-9]{1,8})(?:#L\d+(?:-L?\d+)?)?\b/);
+	if (homeMatch) {
+		const rel = homeMatch[1]!;
+		const absPath = join(opts.homeDir ?? homedir(), rel);
+		return existsSync(absPath)
+			? { status: "valid", detail: `文件仍在：~/${rel}` }
+			: { status: "stale-file-missing", detail: `溯源文件已不存在：~/${rel}` };
+	}
+
+	// 2) Absolute paths like /Users/alice/.config/app.json.
+	const absMatch = raw.match(/(?:^|[\s(（;；,，:："'`])(\/(?:[a-zA-Z0-9_.-]+\/)+[a-zA-Z0-9_.-]+\.[a-zA-Z0-9]{1,8})(?:#L\d+(?:-L?\d+)?)?\b/);
+	if (absMatch) {
+		const absPath = absMatch[1]!;
+		return existsSync(absPath)
+			? { status: "valid", detail: `文件仍在：${absPath}` }
+			: { status: "stale-file-missing", detail: `溯源文件已不存在：${absPath}` };
+	}
+
 	const repoRoot = resolveRepoRoot(cwd);
 	if (!repoRoot) return { status: "unverifiable", detail: "未提供仓库目录" };
 
-	// Extract relative file path like src/core/lock.ts#L1-L40 or cmd/app/main.go
-	const pathMatch = raw.match(/\b((?:[a-zA-Z0-9_.-]+\/)+[a-zA-Z0-9_.-]+\.[a-zA-Z0-9]{1,8})(?:#L\d+(?:-L?\d+)?)?\b/);
+	// 3) Repo-relative paths like src/core/lock.ts#L1-L40 (never slice out of ~/ or /abs or dot-prefixed segments).
+	const pathMatch = raw.match(/(?<![~\/.\w-])((?:[a-zA-Z0-9_.-]+\/)+[a-zA-Z0-9_.-]+\.[a-zA-Z0-9]{1,8})(?:#L\d+(?:-L?\d+)?)?\b/);
 	const commitMatch = raw.match(/\bcommit\s+([0-9a-f]{7,40})\b/i);
 
 	if (pathMatch) {
 		const relPath = pathMatch[1]!;
 		const absPath = join(repoRoot, relPath);
 		if (!existsSync(absPath)) {
+			if (opts.isGlobal && (!commitMatch || !hasCommitInRepo(repoRoot, commitMatch[1]!))) {
+				return { status: "unverifiable", detail: `通用条目引用了其他仓库路径（${relPath}），当前目录无法核验` };
+			}
 			return { status: "stale-file-missing", detail: `溯源文件已不存在：${relPath}` };
 		}
 		if (commitMatch) {
 			const sha = commitMatch[1]!;
-			try {
-				execFileSync("git", ["-C", repoRoot, "cat-file", "-e", `${sha}^{commit}`], { stdio: "ignore" });
-				const countOut = execFileSync("git", ["-C", repoRoot, "rev-list", "--count", `${sha}..HEAD`, "--", relPath], {
-					encoding: "utf8",
-					stdio: ["ignore", "pipe", "ignore"],
-				}).trim();
-				const commitsAfter = Number.parseInt(countOut, 10);
-				if (Number.isFinite(commitsAfter) && commitsAfter >= 8) {
-					return {
-						status: "stale-file-changed",
-						detail: `溯源文件 ${relPath} 在 ${sha} 之后已历经 ${commitsAfter} 次提交，建议核实是否仍成立`,
-					};
+			if (hasCommitInRepo(repoRoot, sha)) {
+				try {
+					const countOut = execFileSync("git", ["-C", repoRoot, "rev-list", "--count", `${sha}..HEAD`, "--", relPath], {
+						encoding: "utf8",
+						stdio: ["ignore", "pipe", "ignore"],
+					}).trim();
+					const commitsAfter = Number.parseInt(countOut, 10);
+					if (Number.isFinite(commitsAfter) && commitsAfter >= 8) {
+						return {
+							status: "stale-file-changed",
+							detail: `溯源文件 ${relPath} 在 ${sha} 之后已历经 ${commitsAfter} 次提交，建议核实是否仍成立`,
+						};
+					}
+				} catch {
+					// file still exists
 				}
-			} catch {
-				// commit may belong to another repo; file still exists
 			}
 		}
 		return { status: "valid", detail: `文件仍在：${relPath}` };
@@ -203,12 +245,9 @@ export function verifyEvidenceAnchor(
 
 	if (commitMatch) {
 		const sha = commitMatch[1]!;
-		try {
-			execFileSync("git", ["-C", repoRoot, "cat-file", "-e", `${sha}^{commit}`], { stdio: "ignore" });
-			return { status: "valid", detail: `commit ${sha} 在当前仓库有效` };
-		} catch {
-			return { status: "unverifiable", detail: `commit ${sha} 不在当前仓库（可能属于其他项目）` };
-		}
+		return hasCommitInRepo(repoRoot, sha)
+			? { status: "valid", detail: `commit ${sha} 在当前仓库有效` }
+			: { status: "unverifiable", detail: `commit ${sha} 不在当前仓库（可能属于其他项目）` };
 	}
 
 	return { status: "unverifiable", detail: "非文件路径/commit 溯源（如会话编号）" };
@@ -249,7 +288,7 @@ export function evaluateMemoryHealth(
 			const summary = rowSummary(kind, r);
 			const isCurrentOrGlobal = !projectKey || r.project === "global" || r.project === projectKey.toLowerCase();
 			if (cwd && r.evidence && isCurrentOrGlobal) {
-				const res = verifyEvidenceAnchor(r.evidence, cwd);
+				const res = verifyEvidenceAnchor(r.evidence, cwd, { isGlobal: r.project === "global" });
 				if (res.status === "stale-file-missing" || res.status === "stale-file-changed") {
 					evidenceChecks.push({ kind, id: r.id, project: r.project, summary, evidence: r.evidence, status: res.status, detail: res.detail });
 				}
@@ -409,7 +448,9 @@ export function buildDreamPacket(
 		"",
 		"【做梦整理输出要求】",
 		"1. 重点检查：(a) 溯源失效、过时或互相冲突的条目；(b) 误放进 PROFILE.md 的静态工作规则（规则属于 AGENTS.md）；(c) 意图卡是否与代码现状一致；(d) 冷门条目：仍成立就提 verify 草稿，已过时就提 delete/supersede 草稿；(e) 能合并的重复条目。",
-		"2. 所有改动都用 clue 起草进待确认草稿箱，把完整草稿清单（编号 + 前后对比）给用户看，用户确认后 `clue apply`，最后运行 `clue dream --mark-done`。",
+		"2. 所有改动都先用 clue 起草进待确认草稿箱（`reason` 字段写一句人话说明改动意图）。",
+		`3. ${PLAIN_REPORT_RULES}`,
+		"4. 用户确认后再 `clue apply`，最后运行 `clue dream --mark-done`。",
 	);
 
 	return lines.join("\n");

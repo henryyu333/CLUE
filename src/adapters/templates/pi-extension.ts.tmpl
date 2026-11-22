@@ -88,6 +88,7 @@ export default function clueMemory(pi: HostApi) {
 	pi.on("before_agent_start", (event, ctx) => {
 		if (!isMain(ctx) || event.reason === "revive") return;
 		if (!frozenBlock) reset(ctx);
+		noteHarnessSeen(paths, HARNESS);
 		turnStartSha = getHeadSha(paths.home);
 		const prompt = typeof event.prompt === "string" ? event.prompt : "";
 		const base = ctx.getSystemPrompt?.() ?? "";

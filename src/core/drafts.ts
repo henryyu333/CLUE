@@ -66,6 +66,18 @@ const KIND_LABEL: Record<DraftKind, string> = {
 
 const WORKER_REFUSAL = "当前是只读执行窗格（CLUE_ROLE=worker），不能起草或写入记忆。";
 
+/**
+ * Shared reporting constraints (BLUF + Controlled Language + Information Mapping + Progressive Disclosure / COGA)
+ * so every model presents drafts and dream audits in crisp, scannable, non-jargon language.
+ */
+export const PLAIN_REPORT_RULES = [
+	"汇报给用户拍板时，严格遵守 4 条表达约束：",
+	"  - 结论前置：开头 1 句话报整体状态和草稿总数。",
+	"  - 零黑话与零隐含前提：正文禁止直出内部字段名（如 project/evidence/verified_at）、代码函数名、文件路径或提交号；提旧记忆编号必须自带 10 字以内的人话标题。",
+	"  - 固定三段积木：每条按草稿编号写清「哪条记忆（新增/改旧）→ 怎么改 → 为什么改」，限 2~3 行。",
+	"  - 细节后置与低摩擦结尾：技术依据默认不展开（用户追问再给）；结尾直接给简短回复选项（如「全过 / 报编号 / 不改」）。",
+].join("\n");
+
 export function readDrafts(paths: CluePaths): Draft[] {
 	if (!existsSync(paths.draftsPath)) return [];
 	const out: Draft[] = [];
@@ -131,10 +143,11 @@ export function addDraft(
 ): DraftResult {
 	if (isWorkerRole()) return { ok: false, message: WORKER_REFUSAL };
 	if (!DRAFT_KINDS.includes(kind)) return { ok: false, message: `未知草稿类型：${String(kind)}` };
-	// Pin the project now so applying from another directory still targets the same project.
-	// Notes are personal facts and default to global; pitfalls/decisions/intent default to the current project.
-	const pinned = { ...request } as DraftRequest & { project?: string };
-	if ((isLedgerKind(kind) || kind === "intent") && !pinned.project?.trim()) {
+	// Pin the project now for new entries/intent cards so applying from another directory targets the same project.
+	// Existing-row ops (update/supersede/verify/delete/revert) keep the target row's project unless explicitly passed.
+	const pinned = { ...request } as DraftRequest & { project?: string; op?: string };
+	const needsDefaultProject = kind === "intent" || (isLedgerKind(kind) && (!pinned.op || pinned.op === "add"));
+	if (needsDefaultProject && !pinned.project?.trim()) {
 		pinned.project = kind === "note" ? "global" : (ctx.projectKey ?? (kind === "intent" ? undefined : "global"));
 	}
 	const check = runDraft(config, paths, kind, pinned, ctx.projectKey, ctx.skipSlots, true);
